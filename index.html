@@ -1,0 +1,2736 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>LA SEBOLLA — pizarra técnica 2D</title>
+<style>
+  html, body, #root { height: 100%; margin: 0; padding: 0; }
+  body { overflow: hidden; overscroll-behavior: none; -webkit-text-size-adjust: 100%; }
+  #ws-loading {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, sans-serif; color: #6B6357; background: #F6F4EF; font-size: 14px;
+  }
+</style>
+<link rel="preconnect" href="https://unpkg.com" />
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js" crossorigin></script>
+</head>
+<body>
+<div id="root"><div id="ws-loading">Cargando LA SEBOLLA…</div></div>
+
+<script type="text/babel" data-presets="react" data-type="module">
+const { useState, useRef, useEffect, useCallback, useMemo } = React;
+
+/* ---------------------------------------------------------------------
+   Shim de almacenamiento persistente: fuera del entorno de Claude usamos
+   localStorage del navegador con la misma forma de API (get/set/delete/list),
+   incluyendo que get() lanza un error si la clave no existe, tal como
+   espera el resto del código (que ya maneja eso con try/catch).
+   --------------------------------------------------------------------- */
+window.storage = {
+  async get(key) {
+    const v = window.localStorage.getItem(key);
+    if (v === null) throw new Error("not found: " + key);
+    return { key, value: v };
+  },
+  async set(key, value) {
+    window.localStorage.setItem(key, value);
+    return { key, value };
+  },
+  async delete(key) {
+    window.localStorage.removeItem(key);
+    return { key, deleted: true };
+  },
+  async list(prefix) {
+    const keys = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (!prefix || k.startsWith(prefix)) keys.push(k);
+    }
+    return { keys, prefix };
+  },
+};
+
+
+/* =========================================================================
+   LA SEBOLLA — pizarra técnica de boceto 2D para soldadores y fabricantes
+   Todo el estado vive en memoria de React; el guardado usa window.storage
+   (persistencia propia de este artifact). Unidades internas: SIEMPRE mm.
+   ========================================================================= */
+
+const UNIT_FACTORS = { mm: 1, cm: 10, m: 1000, in: 25.4 };
+const UNIT_LABEL = { mm: "mm", cm: "cm", m: "m", in: '"' };
+const SHEETS = { A4: { w: 210, h: 297 }, A3: { w: 297, h: 420 }, A2: { w: 420, h: 594 } };
+const PALETTE = [
+  { id: "graphite", hex: "#2B2E33", label: "Grafito" },
+  { id: "gray", hex: "#6B7280", label: "Gris" },
+  { id: "blue", hex: "#2F6FB0", label: "Azul" },
+  { id: "red", hex: "#C6392C", label: "Rojo" },
+];
+/* Catálogo de perfiles esenciales de soldadura / herrería */
+const PROFILE_TYPES = [
+  { id: "angular", label: "Angular (L)" },
+  { id: "i", label: "Perfil I / H (viga)" },
+  { id: "u", label: "Perfil U (canal)" },
+  { id: "t", label: "Perfil T" },
+  { id: "tubular", label: "Tubo cuadrado/rectangular" },
+  { id: "tubo", label: "Tubo redondo (cañería)" },
+  { id: "platina", label: "Platina (barra plana)" },
+  { id: "cuadrado", label: "Cuadrado macizo" },
+  { id: "redondo", label: "Redondo macizo" },
+];
+const PROFILE_NEEDS_THICKNESS = new Set(["i", "u", "t", "tubular", "tubo"]);
+/* Catálogo simplificado de símbolos de soldadura (referencia esquemática, no norma estricta) */
+const WELD_TYPES = [
+  { id: "filete", label: "Filete" },
+  { id: "tope", label: "A tope / ranura" },
+  { id: "punto", label: "Punto" },
+  { id: "tapon", label: "Tapón" },
+];
+const WELD_SIDES = [
+  { id: "flecha", label: "Lado de la flecha" },
+  { id: "otro", label: "Lado opuesto" },
+  { id: "ambos", label: "Ambos lados" },
+];
+const uid = () => Math.random().toString(36).slice(2, 10);
+const round = (n, d = 2) => Math.round(n * 10 ** d) / 10 ** d;
+const toDisplay = (mm, unit) => round(mm / UNIT_FACTORS[unit], unit === "m" ? 3 : 1);
+const fmt = (mm, unit) => `${toDisplay(mm, unit)} ${UNIT_LABEL[unit]}`;
+const dist = (a, b) => Math.hypot(b.x - a.x, b.y - a.y);
+const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+const angleOf = (a, b) => (Math.atan2(b.y - a.y, b.x - a.x) * 180) / Math.PI;
+const rad = (deg) => (deg * Math.PI) / 180;
+const rotatePt = (p, c, deg) => {
+  const r = rad(deg);
+  const dx = p.x - c.x,
+    dy = p.y - c.y;
+  return { x: c.x + dx * Math.cos(r) - dy * Math.sin(r), y: c.y + dx * Math.sin(r) + dy * Math.cos(r) };
+};
+const snapAngleDeg = (a, b, tolDeg = 4) => {
+  // if angle a->b is close to a multiple of 45deg, snap distance-preserving
+  const d = dist(a, b);
+  if (d < 0.01) return b;
+  const ang = angleOf(a, b);
+  const snaps = [0, 45, 90, 135, 180, -45, -90, -135, -180];
+  for (const s of snaps) {
+    let diff = ((ang - s + 540) % 360) - 180;
+    if (Math.abs(diff) <= tolDeg) {
+      const r = rad(s);
+      return { x: a.x + d * Math.cos(r), y: a.y + d * Math.sin(r) };
+    }
+  }
+  return b;
+};
+
+/* ---------- history hook (undo/redo over shapes array) ---------- */
+function useHistory(initial) {
+  const [state, setStateRaw] = useState(initial);
+  const past = useRef([]);
+  const future = useRef([]);
+  const set = useCallback((updater, record = true) => {
+    setStateRaw((prev) => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      if (record) {
+        past.current.push(prev);
+        if (past.current.length > 150) past.current.shift();
+        future.current = [];
+      }
+      return next;
+    });
+  }, []);
+  const undo = useCallback(() => {
+    if (!past.current.length) return;
+    setStateRaw((prev) => {
+      future.current.push(prev);
+      return past.current.pop();
+    });
+  }, []);
+  const redo = useCallback(() => {
+    if (!future.current.length) return;
+    setStateRaw((prev) => {
+      past.current.push(prev);
+      return future.current.pop();
+    });
+  }, []);
+  const replaceNoHistory = useCallback((val) => {
+    past.current = [];
+    future.current = [];
+    setStateRaw(val);
+  }, []);
+  return { state, set, undo, redo, replaceNoHistory, canUndo: () => past.current.length > 0, canRedo: () => future.current.length > 0 };
+}
+
+/* ---------- key points of a shape, used for object-snap ---------- */
+function shapeSnapPoints(s) {
+  switch (s.type) {
+    case "line":
+    case "arrow":
+    case "weld":
+      return [s.p1, s.p2, mid(s.p1, s.p2)];
+    case "rect":
+    case "profile": {
+      const { p1, p2 } = s;
+      const c = [
+        p1,
+        { x: p2.x, y: p1.y },
+        p2,
+        { x: p1.x, y: p2.y },
+        mid(p1, { x: p2.x, y: p1.y }),
+        mid({ x: p2.x, y: p1.y }, p2),
+        mid(p2, { x: p1.x, y: p2.y }),
+        mid({ x: p1.x, y: p2.y }, p1),
+        { x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 },
+      ];
+      return c;
+    }
+    case "circle":
+      return [
+        s.center,
+        { x: s.center.x + s.radius, y: s.center.y },
+        { x: s.center.x - s.radius, y: s.center.y },
+        { x: s.center.x, y: s.center.y + s.radius },
+        { x: s.center.x, y: s.center.y - s.radius },
+      ];
+    case "arc":
+      return [s.center, arcPoint(s.center, s.radius, s.start), arcPoint(s.center, s.radius, s.end)];
+    case "polygon":
+      return s.points;
+    default:
+      return [];
+  }
+}
+function tickAt(p, lineDirDeg, halfLen) {
+  const tAng = rad(lineDirDeg + 45);
+  const tx = Math.cos(tAng) * halfLen,
+    ty = Math.sin(tAng) * halfLen;
+  return { x1: p.x - tx, y1: p.y - ty, x2: p.x + tx, y2: p.y + ty };
+}
+/* Devuelve SIEMPRE un arreglo de contornos (arreglo de arreglos de puntos),
+   porque los perfiles huecos (tubo cuadrado, tubo redondo) necesitan un
+   contorno exterior + uno interior. Los perfiles macizos devuelven un solo
+   contorno dentro del arreglo. */
+function profileOutline(s) {
+  const x = Math.min(s.p1.x, s.p2.x);
+  const y = Math.min(s.p1.y, s.p2.y);
+  const w = Math.max(Math.abs(s.p2.x - s.p1.x), 2);
+  const h = Math.max(Math.abs(s.p2.y - s.p1.y), 2);
+  const t = Math.max(1, Math.min(s.thickness || 5, Math.min(w, h) / 2 - 0.5));
+
+  const rectLoop = (x0, y0, w0, h0) => [
+    { x: x0, y: y0 },
+    { x: x0 + w0, y: y0 },
+    { x: x0 + w0, y: y0 + h0 },
+    { x: x0, y: y0 + h0 },
+  ];
+  const ellipseLoop = (cx, cy, rx, ry, n = 32) => {
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      pts.push({ x: cx + rx * Math.cos(a), y: cy + ry * Math.sin(a) });
+    }
+    return pts;
+  };
+
+  switch (s.profileType) {
+    case "i": {
+      const midL = x + w / 2 - t / 2;
+      const midR = x + w / 2 + t / 2;
+      return [
+        [
+          { x: x, y: y },
+          { x: x + w, y: y },
+          { x: x + w, y: y + t },
+          { x: midR, y: y + t },
+          { x: midR, y: y + h - t },
+          { x: x + w, y: y + h - t },
+          { x: x + w, y: y + h },
+          { x: x, y: y + h },
+          { x: x, y: y + h - t },
+          { x: midL, y: y + h - t },
+          { x: midL, y: y + t },
+          { x: x, y: y + t },
+        ],
+      ];
+    }
+    case "u":
+      return [
+        [
+          { x: x, y: y },
+          { x: x + w, y: y },
+          { x: x + w, y: y + t },
+          { x: x + t, y: y + t },
+          { x: x + t, y: y + h - t },
+          { x: x + w, y: y + h - t },
+          { x: x + w, y: y + h },
+          { x: x, y: y + h },
+        ],
+      ];
+    case "t": {
+      const stemL = x + w / 2 - t / 2;
+      const stemR = x + w / 2 + t / 2;
+      return [
+        [
+          { x: x, y: y },
+          { x: x + w, y: y },
+          { x: x + w, y: y + t },
+          { x: stemR, y: y + t },
+          { x: stemR, y: y + h },
+          { x: stemL, y: y + h },
+          { x: stemL, y: y + t },
+          { x: x, y: y + t },
+        ],
+      ];
+    }
+    case "tubular":
+      return [rectLoop(x, y, w, h), rectLoop(x + t, y + t, Math.max(w - 2 * t, 1), Math.max(h - 2 * t, 1))];
+    case "tubo": {
+      const cx = x + w / 2,
+        cy = y + h / 2;
+      return [ellipseLoop(cx, cy, w / 2, h / 2), ellipseLoop(cx, cy, Math.max(w / 2 - t, 0.5), Math.max(h / 2 - t, 0.5))];
+    }
+    case "redondo": {
+      const cx = x + w / 2,
+        cy = y + h / 2;
+      return [ellipseLoop(cx, cy, w / 2, h / 2)];
+    }
+    case "platina":
+    case "cuadrado":
+      return [rectLoop(x, y, w, h)];
+    case "angular":
+    default:
+      // "angular" — hierro ángulo en L (perfil por defecto)
+      return [
+        [
+          { x: x, y: y },
+          { x: x + w, y: y },
+          { x: x + w, y: y + t },
+          { x: x + t, y: y + t },
+          { x: x + t, y: y + h },
+          { x: x, y: y + h },
+        ],
+      ];
+  }
+}
+function loopsToPathD(loops) {
+  return loops.map((loop) => `M ${loop.map((p) => `${p.x} ${p.y}`).join(" L ")} Z`).join(" ");
+}
+function profileTransform(s) {
+  const x = Math.min(s.p1.x, s.p2.x);
+  const y = Math.min(s.p1.y, s.p2.y);
+  const w = Math.abs(s.p2.x - s.p1.x);
+  const h = Math.abs(s.p2.y - s.p1.y);
+  const cx = x + w / 2,
+    cy = y + h / 2;
+  const rot = s.rotation || 0;
+  const sx = s.mirror ? -1 : 1;
+  const sy = s.mirrorV ? -1 : 1;
+  return `translate(${cx} ${cy}) rotate(${rot}) scale(${sx} ${sy}) translate(${-cx} ${-cy})`;
+}
+function arcPoint(c, r, deg) {
+  return { x: c.x + r * Math.cos(rad(deg)), y: c.y + r * Math.sin(rad(deg)) };
+}
+/* Geometría del símbolo de soldadura: línea de referencia (horizontal) desde el
+   punto de codo (p2) hacia afuera, línea guía con flecha hacia la junta (p1),
+   y el glifo del tipo de soldadura pegado al codo, arriba y/o abajo de la línea
+   según el lado indicado (flecha / opuesto / ambos). Es una representación
+   esquemática pensada para uso práctico en taller, no la norma AWS/ISO estricta. */
+function weldGeom(s) {
+  const p1 = s.p1,
+    p2 = s.p2;
+  const length = s.length || 40;
+  const gs = 8; // tamaño del glifo
+  const dir = p2.x - p1.x >= 0 ? 1 : -1;
+  const refEnd = { x: p2.x + dir * length, y: p2.y };
+  const glyphAt = (sgn) => {
+    const gx = p2.x,
+      gy = p2.y;
+    switch (s.weldType) {
+      case "tope":
+        return {
+          kind: "lines",
+          lines: [
+            { x1: gx, y1: gy, x2: gx, y2: gy + sgn * gs * 0.8 },
+            { x1: gx + dir * gs * 0.55, y1: gy, x2: gx + dir * gs * 0.55, y2: gy + sgn * gs * 0.8 },
+          ],
+        };
+      case "punto":
+        return { kind: "circle", cx: gx + dir * gs * 0.5, cy: gy + sgn * gs * 0.5, r: gs * 0.4 };
+      case "tapon":
+        return { kind: "rect", x: gx + (dir > 0 ? 0 : -gs * 0.6), y: sgn > 0 ? gy : gy - gs * 0.6, w: gs * 0.6, h: gs * 0.6 };
+      case "filete":
+      default:
+        return {
+          kind: "polygon",
+          points: [
+            { x: gx, y: gy },
+            { x: gx + dir * gs, y: gy },
+            { x: gx, y: gy + sgn * gs },
+          ],
+        };
+    }
+  };
+  const glyphs = [];
+  if (s.side === "flecha" || s.side === "ambos") glyphs.push(glyphAt(1));
+  if (s.side === "otro" || s.side === "ambos") glyphs.push(glyphAt(-1));
+
+  return {
+    leader: { x1: p2.x, y1: p2.y, x2: p1.x, y2: p1.y },
+    ref: { x1: p2.x, y1: p2.y, x2: refEnd.x, y2: refEnd.y },
+    glyphs,
+    dir,
+    refEnd,
+    sizePos: { x: p2.x + dir * (gs + 3), y: p2.y - 2, anchor: dir > 0 ? "start" : "end" },
+    tailPos: { x: refEnd.x + dir * 3, y: refEnd.y, anchor: dir > 0 ? "start" : "end" },
+    allAround: s.allAround ? { cx: p2.x, cy: p2.y, r: 4 } : null,
+    campo: s.campo
+      ? {
+          points: [
+            { x: p2.x, y: p2.y - 6 },
+            { x: p2.x + 6, y: p2.y - 6 },
+            { x: p2.x, y: p2.y - 2 },
+          ],
+        }
+      : null,
+  };
+}
+function normalizeSweep(start, end) {
+  let s = ((start % 360) + 360) % 360;
+  let e = ((end % 360) + 360) % 360;
+  if (e < s) e += 360;
+  return { s, e };
+}
+function arcPath(c, r, start, end) {
+  const { s, e } = normalizeSweep(start, end);
+  const p1 = arcPoint(c, r, s);
+  const p2 = arcPoint(c, r, e);
+  const large = e - s > 180 ? 1 : 0;
+  return `M ${p1.x} ${p1.y} A ${r} ${r} 0 ${large} 1 ${p2.x} ${p2.y}`;
+}
+
+/* ---------- default document ---------- */
+const emptyDoc = () => ({
+  shapes: [],
+  unit: "mm",
+  gridSize: 10,
+  showGrid: true,
+  snapOn: true,
+  sheet: { type: "A4", orientation: "vertical", customW: 900, customH: 600 },
+});
+
+/* small script loader for jsPDF (export to PDF) */
+const scriptCache = {};
+function loadScript(src) {
+  if (scriptCache[src]) return scriptCache[src];
+  scriptCache[src] = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return scriptCache[src];
+}
+
+function WeldSketch() {
+  const doc = useHistory(emptyDoc());
+  const d = doc.state;
+  const setDoc = doc.set;
+
+  const [tool, setTool] = useState("select");
+  const [dimKind, setDimKind] = useState("auto");
+  const [profileType, setProfileType] = useState("angular");
+  const [weldType, setWeldType] = useState("filete");
+  const [activeColor, setActiveColor] = useState(PALETTE[0].hex);
+  const [selectedId, setSelectedId] = useState(null);
+  const [draft, setDraft] = useState(null); // { points: [...], cursor }
+  const [textEdit, setTextEdit] = useState(null); // {id, value, isNew}
+  const [dimEdit, setDimEdit] = useState(null); // {id, value}
+  const [measureEdit, setMeasureEdit] = useState(null); // {id, value, pos}
+  const [theme, setTheme] = useState("light");
+  const [modal, setModal] = useState(null); // {type:'open'|'save', ...}
+  const [projects, setProjects] = useState([]);
+  const [projectId, setProjectId] = useState(null);
+  const [projectName, setProjectName] = useState("Boceto sin título");
+  const [saveStatus, setSaveStatus] = useState("");
+  const [dragState, setDragState] = useState(null); // active drag operation
+  const [viewport, setViewport] = useState({ scale: 2.2, ox: 60, oy: 40 });
+  const [cursorWorld, setCursorWorld] = useState({ x: 0, y: 0 });
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const svgRef = useRef(null);
+  const panRef = useRef(null);
+  const autosaveTimer = useRef(null);
+  const activePointers = useRef(new Map());
+  const pinchState = useRef(null);
+  const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false);
+  const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+
+  const sheetDims = useMemo(() => {
+    if (d.sheet.type === "infinite") return null;
+    const base = d.sheet.type === "custom" ? { w: Math.max(1, d.sheet.customW || 900), h: Math.max(1, d.sheet.customH || 600) } : SHEETS[d.sheet.type];
+    return d.sheet.orientation === "horizontal" ? { w: base.h, h: base.w } : { w: base.w, h: base.h };
+  }, [d.sheet]);
+
+  const selected = d.shapes.find((s) => s.id === selectedId) || null;
+
+  useEffect(() => {
+    if (selectedId && tool === "select") setMobilePropsOpen(true);
+    if (!selectedId) setMobilePropsOpen(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  /* ---------------- coordinate transforms ---------------- */
+  const worldToScreen = useCallback((p) => ({ x: p.x * viewport.scale + viewport.ox, y: p.y * viewport.scale + viewport.oy }), [viewport]);
+  const screenToWorld = useCallback((p) => ({ x: (p.x - viewport.ox) / viewport.scale, y: (p.y - viewport.oy) / viewport.scale }), [viewport]);
+
+  const getPointerWorld = useCallback(
+    (e) => {
+      const rect = svgRef.current.getBoundingClientRect();
+      return screenToWorld({ x: e.clientX - rect.left, y: e.clientY - rect.top });
+    },
+    [screenToWorld]
+  );
+
+  /* ---------------- snapping ---------------- */
+  const snapWorldPoint = useCallback(
+    (p, excludeId) => {
+      if (!d.snapOn) return p;
+      const thresholdWorld = 9 / viewport.scale;
+      let best = null;
+      let bestD = thresholdWorld;
+      for (const s of d.shapes) {
+        if (s.id === excludeId) continue;
+        for (const sp of shapeSnapPoints(s)) {
+          const dd = dist(p, sp);
+          if (dd < bestD) {
+            bestD = dd;
+            best = sp;
+          }
+        }
+      }
+      if (best) return best;
+      // grid snap
+      const g = d.gridSize;
+      return { x: Math.round(p.x / g) * g, y: Math.round(p.y / g) * g };
+    },
+    [d.shapes, d.snapOn, d.gridSize, viewport.scale]
+  );
+
+  /* ---------------- shape creation ---------------- */
+  const pushShape = (shape) => {
+    const finalShape = MEASURABLE_TYPES.has(shape.type) && shape.showMeasure === undefined ? { ...shape, showMeasure: true } : shape;
+    setDoc((prev) => ({ ...prev, shapes: [...prev.shapes, finalShape] }));
+    setSelectedId(finalShape.id);
+  };
+  const updateShape = (id, patch, record = true) => {
+    setDoc((prev) => ({ ...prev, shapes: prev.shapes.map((s) => (s.id === id ? { ...s, ...(typeof patch === "function" ? patch(s) : patch) } : s)) }), record);
+  };
+  const deleteShape = (id) => {
+    setDoc((prev) => ({ ...prev, shapes: prev.shapes.filter((s) => s.id !== id) }));
+    if (selectedId === id) setSelectedId(null);
+  };
+  const duplicateSelected = () => {
+    if (!selected) return;
+    const off = { x: 10, y: 10 };
+    const moved = translateShape(selected, off);
+    const copy = { ...moved, id: uid() };
+    pushShape(copy);
+  };
+
+  function translateShape(s, off) {
+    switch (s.type) {
+      case "line":
+      case "arrow":
+      case "weld":
+      case "dimension":
+        return { ...s, p1: { x: s.p1.x + off.x, y: s.p1.y + off.y }, p2: { x: s.p2.x + off.x, y: s.p2.y + off.y }, ...(s.p3 ? { p3: { x: s.p3.x + off.x, y: s.p3.y + off.y } } : {}) };
+      case "rect":
+      case "profile":
+        return { ...s, p1: { x: s.p1.x + off.x, y: s.p1.y + off.y }, p2: { x: s.p2.x + off.x, y: s.p2.y + off.y } };
+      case "circle":
+      case "arc":
+        return { ...s, center: { x: s.center.x + off.x, y: s.center.y + off.y } };
+      case "polygon":
+        return { ...s, points: s.points.map((p) => ({ x: p.x + off.x, y: p.y + off.y })) };
+      case "text":
+        return { ...s, pos: { x: s.pos.x + off.x, y: s.pos.y + off.y } };
+      default:
+        return s;
+    }
+  }
+
+  /* ---------------- tool interaction: click on canvas ---------------- */
+  const cancelDraft = () => setDraft(null);
+
+  const finishPolygon = (points) => {
+    if (points.length >= 3) pushShape({ id: uid(), type: "polygon", points, color: activeColor });
+    setDraft(null);
+  };
+
+  const handleCanvasPointerDown = (e) => {
+    activePointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+    if (activePointers.current.size >= 2) {
+      // entering / continuing a two-finger gesture: cancel any single-finger action in progress
+      panRef.current = null;
+      setDraft(null);
+      setDragState(null);
+      const pts = Array.from(activePointers.current.values()).slice(0, 2);
+      const dx0 = pts[1].x - pts[0].x,
+        dy0 = pts[1].y - pts[0].y;
+      const dist0 = Math.hypot(dx0, dy0) || 1;
+      const mid0 = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      const rect = svgRef.current.getBoundingClientRect();
+      const worldMid = screenToWorld({ x: mid0.x - rect.left, y: mid0.y - rect.top });
+      pinchState.current = { dist0, worldMid, startScale: viewport.scale };
+      return;
+    }
+
+    if (e.button === 1 || spaceHeld || tool === "mano") {
+      panRef.current = { startX: e.clientX, startY: e.clientY, ox: viewport.ox, oy: viewport.oy };
+      return;
+    }
+    const raw = getPointerWorld(e);
+    const p = snapWorldPoint(raw, draft && draft.excludeId);
+
+    if (tool === "select") return; // handled by shape/handle onPointerDown
+    if (tool === "borrar") return; // handled by shape onClick
+
+    if (tool === "line" || tool === "arrow") {
+      if (!draft) setDraft({ tool, points: [p] });
+      else {
+        const p1 = draft.points[0];
+        const p2 = snapAngleDeg(p1, p);
+        pushShape({ id: uid(), type: tool, p1, p2, color: activeColor });
+        setDraft(null);
+      }
+      return;
+    }
+    if (tool === "rect") {
+      if (!draft) setDraft({ tool, points: [p] });
+      else {
+        pushShape({ id: uid(), type: "rect", p1: draft.points[0], p2: p, color: activeColor });
+        setDraft(null);
+      }
+      return;
+    }
+    if (tool === "perfil") {
+      if (!draft) setDraft({ tool, points: [p], profileType });
+      else {
+        pushShape({ id: uid(), type: "profile", profileType: draft.profileType || profileType, p1: draft.points[0], p2: p, thickness: 5, rotation: 0, mirror: false, mirrorV: false, color: activeColor });
+        setDraft(null);
+      }
+      return;
+    }
+    if (tool === "circle") {
+      if (!draft) setDraft({ tool, points: [p] });
+      else {
+        pushShape({ id: uid(), type: "circle", center: draft.points[0], radius: dist(draft.points[0], p), color: activeColor });
+        setDraft(null);
+      }
+      return;
+    }
+    if (tool === "arc") {
+      if (!draft) setDraft({ tool, points: [p] });
+      else if (draft.points.length === 1) setDraft({ tool, points: [...draft.points, p] });
+      else {
+        const [center, startP] = draft.points;
+        const radius = dist(center, startP);
+        const start = angleOf(center, startP);
+        const end = angleOf(center, p);
+        pushShape({ id: uid(), type: "arc", center, radius, start, end, color: activeColor });
+        setDraft(null);
+      }
+      return;
+    }
+    if (tool === "polygon") {
+      if (!draft) setDraft({ tool, points: [p] });
+      else {
+        const first = draft.points[0];
+        if (draft.points.length >= 3 && dist(first, p) < 6 / viewport.scale) {
+          finishPolygon(draft.points);
+        } else {
+          setDraft({ tool, points: [...draft.points, p] });
+        }
+      }
+      return;
+    }
+    if (tool === "texto") {
+      const id = uid();
+      setTextEdit({ id, value: "", isNew: true, pos: p });
+      return;
+    }
+    if (tool === "cota") {
+      if (dimKind === "angulo") {
+        if (!draft) setDraft({ tool, points: [p] });
+        else if (draft.points.length === 1) setDraft({ tool, points: [...draft.points, p] });
+        else {
+          const [vertex, r1] = draft.points;
+          pushShape({ id: uid(), type: "dimension", kind: "angulo", p1: vertex, p2: r1, p3: p, offset: 20, color: activeColor });
+          setDraft(null);
+        }
+      } else {
+        if (!draft) setDraft({ tool, points: [p] });
+        else {
+          const p1 = draft.points[0];
+          let kind = dimKind;
+          if (dimKind === "auto") {
+            const dx = Math.abs(p.x - p1.x);
+            const dy = Math.abs(p.y - p1.y);
+            kind = dx >= dy ? "horizontal" : "vertical";
+          }
+          const offset = kind === "horizontal" || kind === "vertical" ? pickDimSide(p1, p, kind, d.shapes) * 20 : -20;
+          pushShape({ id: uid(), type: "dimension", kind, p1, p2: p, offset, color: activeColor });
+          setDraft(null);
+        }
+      }
+      return;
+    }
+    if (tool === "weld") {
+      if (!draft) setDraft({ tool, points: [p], weldType });
+      else {
+        pushShape({
+          id: uid(),
+          type: "weld",
+          weldType: draft.weldType || weldType,
+          p1: draft.points[0],
+          p2: p,
+          side: "flecha",
+          size: "",
+          length: 40,
+          allAround: false,
+          campo: false,
+          tail: "",
+          color: activeColor,
+        });
+        setDraft(null);
+      }
+      return;
+    }
+  };
+
+  const handleCanvasPointerMove = (e) => {
+    if (activePointers.current.has(e.pointerId)) {
+      activePointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+
+    if (activePointers.current.size >= 2 && pinchState.current) {
+      const pts = Array.from(activePointers.current.values()).slice(0, 2);
+      const dx1 = pts[1].x - pts[0].x,
+        dy1 = pts[1].y - pts[0].y;
+      const dist1 = Math.hypot(dx1, dy1) || 1;
+      const mid1 = { x: (pts[0].x + pts[1].x) / 2, y: (pts[0].y + pts[1].y) / 2 };
+      const rect = svgRef.current.getBoundingClientRect();
+      const factor = dist1 / pinchState.current.dist0;
+      const newScale = Math.min(40, Math.max(0.15, pinchState.current.startScale * factor));
+      const screenMid = { x: mid1.x - rect.left, y: mid1.y - rect.top };
+      setViewport({
+        scale: newScale,
+        ox: screenMid.x - pinchState.current.worldMid.x * newScale,
+        oy: screenMid.y - pinchState.current.worldMid.y * newScale,
+      });
+      return;
+    }
+
+    if (panRef.current) {
+      const dx = e.clientX - panRef.current.startX;
+      const dy = e.clientY - panRef.current.startY;
+      setViewport((v) => ({ ...v, ox: panRef.current.ox + dx, oy: panRef.current.oy + dy }));
+      return;
+    }
+    const raw = getPointerWorld(e);
+    const p = snapWorldPoint(raw, dragState && dragState.id);
+    setCursorWorld(p);
+
+    if (dragState) {
+      applyDrag(dragState, p);
+      return;
+    }
+    if (draft) setDraft((dft) => ({ ...dft, cursor: p }));
+  };
+
+  const handleCanvasPointerUp = (e) => {
+    if (e && activePointers.current.has(e.pointerId)) activePointers.current.delete(e.pointerId);
+    if (activePointers.current.size < 2) pinchState.current = null;
+    if (activePointers.current.size === 0) {
+      panRef.current = null;
+      if (dragState) setDragState(null);
+    }
+  };
+
+  /* ---------------- dragging shapes / handles (select tool) ---------------- */
+  function startDragMove(e, shape) {
+    e.stopPropagation();
+    if (tool === "borrar") {
+      deleteShape(shape.id);
+      return;
+    }
+    if (tool !== "select") return;
+    setSelectedId(shape.id);
+    const raw = getPointerWorld(e);
+    setDragState({ mode: "move", id: shape.id, start: raw, origShape: shape });
+  }
+  function startDragHandle(e, shape, handleKey) {
+    e.stopPropagation();
+    if (tool !== "select") return;
+    setSelectedId(shape.id);
+    setDragState({ mode: "handle", id: shape.id, handleKey, origShape: shape });
+  }
+
+  function applyDrag(ds, p) {
+    if (ds.mode === "move") {
+      const off = { x: p.x - snapWorldPoint(ds.start).x, y: p.y - snapWorldPoint(ds.start).y };
+      updateShape(ds.id, () => translateShape(ds.origShape, off), false);
+      return;
+    }
+    if (ds.mode === "handle") {
+      const s = ds.origShape;
+      switch (s.type) {
+        case "line":
+        case "arrow":
+        case "weld":
+          updateShape(ds.id, ds.handleKey === "p1" ? { p1: p } : { p2: p }, false);
+          break;
+        case "rect":
+        case "profile":
+          updateShape(ds.id, ds.handleKey === "p1" ? { p1: p } : { p2: p }, false);
+          break;
+        case "circle":
+          updateShape(ds.id, { radius: Math.max(1, dist(s.center, p)) }, false);
+          break;
+        case "arc": {
+          if (ds.handleKey === "center") updateShape(ds.id, { center: p }, false);
+          else if (ds.handleKey === "start") updateShape(ds.id, { radius: dist(s.center, p), start: angleOf(s.center, p) }, false);
+          else updateShape(ds.id, { radius: dist(s.center, p), end: angleOf(s.center, p) }, false);
+          break;
+        }
+        case "polygon": {
+          const idx = ds.handleKey;
+          const pts = s.points.map((pt, i) => (i === idx ? p : pt));
+          updateShape(ds.id, { points: pts }, false);
+          break;
+        }
+        case "text":
+          updateShape(ds.id, { pos: p }, false);
+          break;
+        case "dimension": {
+          if (ds.handleKey === "p1") updateShape(ds.id, { p1: p }, false);
+          else if (ds.handleKey === "p2") updateShape(ds.id, { p2: p }, false);
+          else if (ds.handleKey === "offset") {
+            const perp = dimOffsetFromDrag(s, p);
+            updateShape(ds.id, { offset: perp }, false);
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+
+  function dimOffsetFromDrag(s, p) {
+    if (s.kind === "horizontal") return p.y - Math.min(s.p1.y, s.p2.y) < 0 ? -(Math.min(s.p1.y, s.p2.y) - p.y) : -(Math.min(s.p1.y, s.p2.y) - p.y);
+    if (s.kind === "vertical") return p.x - Math.max(s.p1.x, s.p2.x);
+    // diagonal / diameter / radius: perpendicular distance signed
+    const a = s.p1,
+      b = s.p2;
+    const dx = b.x - a.x,
+      dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len,
+      ny = dx / len;
+    return (p.x - a.x) * nx + (p.y - a.y) * ny;
+  }
+
+  /* commit drag into history once pointer released */
+  useEffect(() => {
+    if (dragState === null) {
+      // no-op; final state already applied without recording. Record a checkpoint:
+    }
+  }, [dragState]);
+  const prevDragRef = useRef(null);
+  useEffect(() => {
+    if (prevDragRef.current && !dragState) {
+      // push a history checkpoint by touching set() with identity update
+      setDoc((prev) => ({ ...prev }), true);
+    }
+    prevDragRef.current = dragState;
+  }, [dragState, setDoc]);
+
+  /* ---------------- zoom / pan controls ---------------- */
+  const onWheel = (e) => {
+    e.preventDefault();
+    const rect = svgRef.current.getBoundingClientRect();
+    const cursor = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const worldBefore = screenToWorld(cursor);
+    const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    const newScale = Math.min(40, Math.max(0.15, viewport.scale * factor));
+    setViewport({ scale: newScale, ox: cursor.x - worldBefore.x * newScale, oy: cursor.y - worldBefore.y * newScale });
+  };
+
+  const zoomToFit = useCallback(
+    (onlySelected = false) => {
+      const rect = svgRef.current.getBoundingClientRect();
+      let shapesToFit = onlySelected && selected ? [selected] : d.shapes;
+      let pts = [];
+      shapesToFit.forEach((s) => (pts = pts.concat(shapeSnapPoints(s))));
+      if (sheetDims && !onlySelected) pts = pts.concat([{ x: 0, y: 0 }, { x: sheetDims.w, y: sheetDims.h }]);
+      if (!pts.length) {
+        setViewport({ scale: 2.2, ox: 60, oy: 40 });
+        return;
+      }
+      const minX = Math.min(...pts.map((p) => p.x));
+      const maxX = Math.max(...pts.map((p) => p.x));
+      const minY = Math.min(...pts.map((p) => p.y));
+      const maxY = Math.max(...pts.map((p) => p.y));
+      const wW = Math.max(maxX - minX, 10);
+      const wH = Math.max(maxY - minY, 10);
+      const margin = 40;
+      const scale = Math.min((rect.width - margin * 2) / wW, (rect.height - margin * 2) / wH);
+      setViewport({ scale, ox: margin - minX * scale, oy: margin - minY * scale });
+    },
+    [d.shapes, sheetDims, selected]
+  );
+
+  /* ---------------- keyboard shortcuts ---------------- */
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const tag = (e.target.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea") return;
+      if (e.code === "Space") setSpaceHeld(true);
+      if (e.ctrlKey || e.metaKey) {
+        if (e.key.toLowerCase() === "z") {
+          e.preventDefault();
+          doc.undo();
+        } else if (e.key.toLowerCase() === "y") {
+          e.preventDefault();
+          doc.redo();
+        } else if (e.key.toLowerCase() === "s") {
+          e.preventDefault();
+          handleSave();
+        } else if (e.key.toLowerCase() === "d") {
+          e.preventDefault();
+          duplicateSelected();
+        }
+        return;
+      }
+      if (e.key === "Escape") {
+        setDraft(null);
+        setTool("select");
+      }
+      if ((e.key === "Delete" || e.key === "Backspace") && selectedId) {
+        e.preventDefault();
+        deleteShape(selectedId);
+      }
+      const map = { l: "line", r: "rect", c: "circle", d: "cota", t: "texto", a: "arc", p: "polygon", f: "arrow", v: "select", h: "mano", g: "perfil", s: "weld" };
+      if (map[e.key.toLowerCase()] && !e.repeat) setTool(map[e.key.toLowerCase()]);
+    };
+    const onKeyUp = (e) => {
+      if (e.code === "Space") setSpaceHeld(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, doc]);
+
+  /* ---------------- text editing commit ---------------- */
+  const commitText = () => {
+    if (!textEdit) return;
+    const { id, value, isNew, pos } = textEdit;
+    if (value.trim()) {
+      if (isNew) pushShape({ id, type: "text", pos, text: value, size: 14, rotation: 0, color: activeColor });
+      else updateShape(id, { text: value });
+    } else if (!isNew) {
+      deleteShape(id);
+    }
+    setTextEdit(null);
+  };
+
+  /* ---------------- persistence (window.storage) ---------------- */
+  const refreshProjects = useCallback(async () => {
+    try {
+      const idx = await window.storage.get("projects-index");
+      setProjects(idx ? JSON.parse(idx.value) : []);
+    } catch {
+      setProjects([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const auto = await window.storage.get("autosave-current");
+        if (auto) {
+          const data = JSON.parse(auto.value);
+          doc.replaceNoHistory(data.doc || emptyDoc());
+          setProjectId(data.projectId || null);
+          setProjectName(data.projectName || "Boceto sin título");
+        }
+      } catch {
+        /* nothing saved yet */
+      }
+      refreshProjects();
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // autosave (debounced) whenever the document changes
+  useEffect(() => {
+    setSaveStatus("Guardando...");
+    if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set("autosave-current", JSON.stringify({ doc: d, projectId, projectName }));
+        setSaveStatus("Guardado");
+      } catch {
+        setSaveStatus("");
+      }
+    }, 700);
+    return () => clearTimeout(autosaveTimer.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [d, projectId, projectName]);
+
+  async function persistProject(id, name) {
+    await window.storage.set(`project:${id}`, JSON.stringify({ name, doc: d }));
+    const idx = await window.storage.get("projects-index").catch(() => null);
+    let list = idx ? JSON.parse(idx.value) : [];
+    list = list.filter((p) => p.id !== id);
+    list.unshift({ id, name, updatedAt: Date.now() });
+    await window.storage.set("projects-index", JSON.stringify(list));
+    setProjects(list);
+  }
+
+  function handleSave() {
+    if (projectId) {
+      persistProject(projectId, projectName);
+    } else {
+      setModal({ type: "save", name: projectName });
+    }
+  }
+  function confirmSaveAs(name) {
+    const id = projectId || uid();
+    setProjectId(id);
+    setProjectName(name);
+    persistProject(id, name);
+    setModal(null);
+  }
+  async function openProject(p) {
+    const rec = await window.storage.get(`project:${p.id}`);
+    const data = JSON.parse(rec.value);
+    doc.replaceNoHistory(data.doc);
+    setProjectId(p.id);
+    setProjectName(data.name);
+    setSelectedId(null);
+    setModal(null);
+  }
+  async function deleteProject(p) {
+    await window.storage.delete(`project:${p.id}`).catch(() => {});
+    const list = projects.filter((x) => x.id !== p.id);
+    await window.storage.set("projects-index", JSON.stringify(list));
+    setProjects(list);
+  }
+  function handleNew() {
+    doc.replaceNoHistory(emptyDoc());
+    setProjectId(null);
+    setProjectName("Boceto sin título");
+    setSelectedId(null);
+  }
+
+  /* ---------------- export ---------------- */
+  function buildStandaloneSVG() {
+    const pts = d.shapes.reduce((acc, s) => acc.concat(shapeSnapPoints(s)), []);
+    let bbox;
+    if (sheetDims) bbox = { minX: 0, minY: 0, maxX: sheetDims.w, maxY: sheetDims.h };
+    else if (pts.length) {
+      bbox = {
+        minX: Math.min(...pts.map((p) => p.x)) - 20,
+        minY: Math.min(...pts.map((p) => p.y)) - 20,
+        maxX: Math.max(...pts.map((p) => p.x)) + 20,
+        maxY: Math.max(...pts.map((p) => p.y)) + 20,
+      };
+    } else bbox = { minX: 0, minY: 0, maxX: 200, maxY: 200 };
+    const w = bbox.maxX - bbox.minX;
+    const h = bbox.maxY - bbox.minY;
+    const body = d.shapes.map((s) => renderShapeStatic(s, d.unit)).join("\n");
+    const arrowMarker = `<defs><marker id="arrowend" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="context-stroke" /></marker></defs>`;
+    return { svg: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${bbox.minX} ${bbox.minY} ${w} ${h}" width="${w}mm" height="${h}mm">${arrowMarker}<rect x="${bbox.minX}" y="${bbox.minY}" width="${w}" height="${h}" fill="#ffffff"/>${body}</svg>`, w, h };
+  }
+
+  function download(filename, blobOrUrl, isUrl) {
+    const a = document.createElement("a");
+    a.href = isUrl ? blobOrUrl : URL.createObjectURL(blobOrUrl);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function exportSVG() {
+    const { svg } = buildStandaloneSVG();
+    download(`${projectName || "weldsketch"}.svg`, new Blob([svg], { type: "image/svg+xml" }));
+  }
+
+  function svgToPngDataUrl(scaleFactor = 4) {
+    return new Promise((resolve, reject) => {
+      const { svg, w, h } = buildStandaloneSVG();
+      const img = new Image();
+      const svg64 = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svg)));
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = w * scaleFactor;
+        canvas.height = h * scaleFactor;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve({ dataUrl: canvas.toDataURL("image/png"), w, h });
+      };
+      img.onerror = reject;
+      img.src = svg64;
+    });
+  }
+
+  async function exportPNG() {
+    const { dataUrl } = await svgToPngDataUrl(4);
+    download(`${projectName || "weldsketch"}.png`, dataUrl, true);
+  }
+
+  async function exportPDF() {
+    setSaveStatus("Exportando PDF...");
+    try {
+      await loadScript("https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js");
+      const { dataUrl, w, h } = await svgToPngDataUrl(6);
+      const { jsPDF } = window.jspdf;
+      const pdf = new jsPDF({ unit: "mm", format: [w, h], orientation: w > h ? "landscape" : "portrait" });
+      pdf.addImage(dataUrl, "PNG", 0, 0, w, h);
+      pdf.save(`${projectName || "weldsketch"}.pdf`);
+    } finally {
+      setSaveStatus("Guardado");
+    }
+  }
+
+  /* =========================================================================
+     RENDER
+     ========================================================================= */
+  return (
+    <div className={`ws-root ${theme}`}>
+      <style>{CSS}</style>
+
+      {/* TOP BAR */}
+      <div className="ws-topbar">
+        <button className="ws-mobiletoggle" onClick={() => setMobileToolbarOpen((o) => !o)} title="Herramientas">
+          ☰
+        </button>
+        <div className="ws-brand">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+            <path d="M4 18 L10 6 L14 14 L17 8 L20 18" stroke="var(--accent)" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+          <div className="ws-brandtext">
+            <span>LA SEBOLLA</span>
+            <span className="ws-signature">Angel Alfin · Venezuela</span>
+          </div>
+        </div>
+        <input className="ws-projname" value={projectName} onChange={(e) => setProjectName(e.target.value)} />
+        <button className="ws-mobiletoggle ws-mobilepropsbtn" onClick={() => setMobilePropsOpen((o) => !o)} title="Propiedades">
+          ⚙
+        </button>
+        <div className="ws-topactions">
+          <button onClick={handleNew}>Nuevo</button>
+          <button
+            onClick={() => {
+              refreshProjects();
+              setModal({ type: "open" });
+            }}
+          >
+            Abrir
+          </button>
+          <button onClick={handleSave}>Guardar</button>
+          <button disabled={!doc.canUndo()} onClick={doc.undo} title="Ctrl+Z">
+            ↶ Deshacer
+          </button>
+          <button disabled={!doc.canRedo()} onClick={doc.redo} title="Ctrl+Y">
+            ↷ Rehacer
+          </button>
+          <div className="ws-exportgroup">
+            <button onClick={exportSVG}>Exportar SVG</button>
+            <button onClick={exportPNG}>Exportar PNG</button>
+            <button className="primary" onClick={exportPDF}>
+              Exportar PDF
+            </button>
+          </div>
+          <button className="ws-theme" onClick={() => setTheme((t) => (t === "light" ? "dark" : "light"))} title="Cambiar tema">
+            {theme === "light" ? "🌙" : "☀️"}
+          </button>
+        </div>
+      </div>
+
+      <div className="ws-body">
+        {/* LEFT TOOLBAR */}
+        <div className={`ws-toolbar ${mobileToolbarOpen ? "open" : ""}`}>
+          <button className="ws-drawerclose" onClick={() => setMobileToolbarOpen(false)}>
+            ✕ Cerrar
+          </button>
+          <ToolBtn active={tool === "select"} label="Seleccionar" hint="V" onClick={() => setTool("select")} icon="cursor" />
+          <ToolBtn active={tool === "mano"} label="Mano" hint="H" onClick={() => setTool("mano")} icon="hand" />
+          <ToolBtn active={tool === "line"} label="Línea" hint="L" onClick={() => setTool("line")} icon="line" />
+          <ToolBtn active={tool === "rect"} label="Rectángulo" hint="R" onClick={() => setTool("rect")} icon="rect" />
+          <ToolBtn active={tool === "circle"} label="Círculo" hint="C" onClick={() => setTool("circle")} icon="circle" />
+          <ToolBtn active={tool === "arc"} label="Arco" hint="A" onClick={() => setTool("arc")} icon="arc" />
+          <ToolBtn active={tool === "polygon"} label="Polígono" hint="P" onClick={() => setTool("polygon")} icon="polygon" />
+          <ToolBtn active={tool === "perfil"} label="Perfil" hint="G" onClick={() => setTool("perfil")} icon="profile" />
+          {tool === "perfil" && (
+            <select className="ws-dimkind" value={profileType} onChange={(e) => setProfileType(e.target.value)}>
+              {PROFILE_TYPES.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          )}
+          <div className="ws-sep" />
+          <ToolBtn active={tool === "texto"} label="Texto" hint="T" onClick={() => setTool("texto")} icon="text" />
+          <ToolBtn active={tool === "cota"} label="Cota" hint="D" onClick={() => setTool("cota")} icon="dim" />
+          <ToolBtn active={tool === "arrow"} label="Flecha" hint="F" onClick={() => setTool("arrow")} icon="arrow" />
+          <ToolBtn active={tool === "weld"} label="Soldadura" hint="S" onClick={() => setTool("weld")} icon="weld" />
+          {tool === "weld" && (
+            <select className="ws-dimkind" value={weldType} onChange={(e) => setWeldType(e.target.value)}>
+              {WELD_TYPES.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.label}
+                </option>
+              ))}
+            </select>
+          )}
+          <div className="ws-sep" />
+          <ToolBtn active={tool === "borrar"} label="Borrar" onClick={() => setTool("borrar")} icon="trash" />
+
+          {tool === "cota" && (
+            <select className="ws-dimkind" value={dimKind} onChange={(e) => setDimKind(e.target.value)}>
+              <option value="auto">Horizontal / Vertical (auto)</option>
+              <option value="diagonal">Diagonal</option>
+              <option value="diametro">Diámetro</option>
+              <option value="radio">Radio</option>
+              <option value="angulo">Ángulo</option>
+            </select>
+          )}
+
+          <div className="ws-sep" />
+          <div className="ws-colors">
+            {PALETTE.map((c) => (
+              <button key={c.id} title={c.label} className={`ws-swatch ${activeColor === c.hex ? "on" : ""}`} style={{ background: c.hex }} onClick={() => setActiveColor(c.hex)} />
+            ))}
+          </div>
+        </div>
+
+        {/* CANVAS */}
+        <div className="ws-canvaswrap">
+          <svg
+            ref={svgRef}
+            className={`ws-canvas ${spaceHeld || tool === "mano" ? "panning" : ""}`}
+            onPointerDown={handleCanvasPointerDown}
+            onPointerMove={handleCanvasPointerMove}
+            onPointerUp={handleCanvasPointerUp}
+            onPointerCancel={handleCanvasPointerUp}
+            onWheel={onWheel}
+            onContextMenu={(e) => e.preventDefault()}
+          >
+            <defs>
+              <marker id="arrowend" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+                <path d="M0,0 L6,3 L0,6 Z" fill="context-stroke" />
+              </marker>
+            </defs>
+
+            <g transform={`translate(${viewport.ox},${viewport.oy}) scale(${viewport.scale})`}>
+              {d.showGrid && <GridLines gridSize={d.gridSize} viewport={viewport} svgRef={svgRef} />}
+              {sheetDims && <rect x={0} y={0} width={sheetDims.w} height={sheetDims.h} className="ws-sheet" />}
+
+              {d.shapes.map((s) => (
+                <ShapeView
+                  key={s.id}
+                  shape={s}
+                  unit={d.unit}
+                  selected={s.id === selectedId}
+                  tool={tool}
+                  scale={viewport.scale}
+                  onPointerDownShape={(e) => startDragMove(e, s)}
+                  onPointerDownHandle={(e, key) => startDragHandle(e, s, key)}
+                  onDoubleClick={() => {
+                    if (s.type === "text") setTextEdit({ id: s.id, value: s.text, isNew: false, pos: s.pos });
+                    else if (s.type === "dimension") setDimEdit({ id: s.id, value: dimEdit && dimEdit.id === s.id ? dimEdit.value : dimLabel(s, d.unit) });
+                  }}
+                  onCotaDoubleClick={(shape, desc) => {
+                    const pos = desc.kind === "leader" || desc.kind === "plain" ? desc.textPos : mid(desc.a, desc.bpt);
+                    const autoDesc = computeAutoCotas({ ...shape, cotas: {} }, d.unit, 1).find((x) => x.side === desc.side);
+                    setMeasureEdit({ id: shape.id, side: desc.side, value: (shape.cotas && shape.cotas[desc.side]) || "", placeholder: autoDesc ? autoDesc.label : "", pos });
+                  }}
+                />
+              ))}
+
+              {draft && draft.cursor && <DraftPreview draft={draft} color={activeColor} scale={viewport.scale} />}
+            </g>
+
+            {textEdit && (
+              <foreignObject x={worldToScreen(textEdit.pos).x} y={worldToScreen(textEdit.pos).y - 12} width="260" height="40">
+                <input autoFocus className="ws-inlineinput" value={textEdit.value} onChange={(e) => setTextEdit({ ...textEdit, value: e.target.value })} onBlur={commitText} onKeyDown={(e) => { if (e.key === "Enter") commitText(); if (e.key === "Escape") setTextEdit(null); }} placeholder="Escribe una nota…" />
+              </foreignObject>
+            )}
+            {dimEdit && selected && selected.id === dimEdit.id && (
+              <foreignObject x={worldToScreen(dimLabelPos(selected)).x - 40} y={worldToScreen(dimLabelPos(selected)).y - 12} width="140" height="30">
+                <input
+                  autoFocus
+                  className="ws-inlineinput"
+                  value={dimEdit.value}
+                  onChange={(e) => setDimEdit({ ...dimEdit, value: e.target.value })}
+                  onBlur={() => {
+                    updateShape(dimEdit.id, { overrideText: dimEdit.value });
+                    setDimEdit(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.target.blur();
+                    if (e.key === "Escape") setDimEdit(null);
+                  }}
+                />
+              </foreignObject>
+            )}
+            {measureEdit && (
+              <foreignObject x={worldToScreen(measureEdit.pos).x - 60} y={worldToScreen(measureEdit.pos).y - 12} width="120" height="28">
+                <input
+                  autoFocus
+                  className="ws-inlineinput"
+                  value={measureEdit.value}
+                  placeholder={measureEdit.placeholder}
+                  onChange={(e) => setMeasureEdit({ ...measureEdit, value: e.target.value })}
+                  onFocus={(e) => e.target.select()}
+                  onBlur={() => {
+                    const shape = d.shapes.find((sh) => sh.id === measureEdit.id);
+                    const cotas = { ...((shape && shape.cotas) || {}), [measureEdit.side]: measureEdit.value };
+                    updateShape(measureEdit.id, { cotas });
+                    setMeasureEdit(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") e.target.blur();
+                    if (e.key === "Escape") setMeasureEdit(null);
+                  }}
+                />
+              </foreignObject>
+            )}
+          </svg>
+
+          <div className="ws-viewctrls">
+            <button onClick={() => zoomToFit(false)} title="Zoom a dibujo">
+              ⤢ Todo
+            </button>
+            <button onClick={() => zoomToFit(true)} disabled={!selected} title="Zoom a selección">
+              ⤢ Selección
+            </button>
+            <button onClick={() => setViewport((v) => ({ ...v, scale: v.scale * 1.2 }))}>+</button>
+            <button onClick={() => setViewport((v) => ({ ...v, scale: v.scale / 1.2 }))}>−</button>
+          </div>
+        </div>
+
+        {/* RIGHT PROPERTIES PANEL */}
+        <div className={`ws-props ${mobilePropsOpen ? "open" : ""}`}>
+          <button className="ws-drawerclose" onClick={() => setMobilePropsOpen(false)}>
+            ✕ Cerrar
+          </button>
+          {!selected && (
+            <>
+              <h4>Documento</h4>
+              <label>
+                Unidades
+                <select value={d.unit} onChange={(e) => setDoc((p) => ({ ...p, unit: e.target.value }))}>
+                  <option value="mm">mm</option>
+                  <option value="cm">cm</option>
+                  <option value="m">m</option>
+                  <option value="in">pulgadas</option>
+                </select>
+              </label>
+              <label>
+                Hoja
+                <select value={d.sheet.type} onChange={(e) => setDoc((p) => ({ ...p, sheet: { ...p.sheet, type: e.target.value } }))}>
+                  <option value="A4">A4</option>
+                  <option value="A3">A3</option>
+                  <option value="A2">A2</option>
+                  <option value="custom">Personalizado</option>
+                  <option value="infinite">Lienzo infinito</option>
+                </select>
+              </label>
+              {d.sheet.type === "custom" && (
+                <>
+                  <label>
+                    Ancho ({UNIT_LABEL[d.unit]})
+                    <input
+                      type="number"
+                      min="1"
+                      value={round(toDisplay(d.sheet.customW || 900, d.unit), 2)}
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (!isNaN(v) && v > 0) setDoc((p) => ({ ...p, sheet: { ...p.sheet, customW: v * UNIT_FACTORS[d.unit] } }));
+                      }}
+                    />
+                  </label>
+                  <label>
+                    Alto ({UNIT_LABEL[d.unit]})
+                    <input
+                      type="number"
+                      min="1"
+                      value={round(toDisplay(d.sheet.customH || 600, d.unit), 2)}
+                      onChange={(e) => {
+                        const v = parseFloat(e.target.value);
+                        if (!isNaN(v) && v > 0) setDoc((p) => ({ ...p, sheet: { ...p.sheet, customH: v * UNIT_FACTORS[d.unit] } }));
+                      }}
+                    />
+                  </label>
+                </>
+              )}
+              {d.sheet.type !== "infinite" && (
+                <label>
+                  Orientación
+                  <select value={d.sheet.orientation} onChange={(e) => setDoc((p) => ({ ...p, sheet: { ...p.sheet, orientation: e.target.value } }))}>
+                    <option value="vertical">Vertical</option>
+                    <option value="horizontal">Horizontal</option>
+                  </select>
+                </label>
+              )}
+              <label className="ws-check">
+                <input type="checkbox" checked={d.showGrid} onChange={(e) => setDoc((p) => ({ ...p, showGrid: e.target.checked }))} />
+                Mostrar cuadrícula
+              </label>
+              <label>
+                Tamaño de cuadrícula
+                <select value={d.gridSize} onChange={(e) => setDoc((p) => ({ ...p, gridSize: Number(e.target.value) }))}>
+                  {[1, 5, 10, 50, 100].map((g) => (
+                    <option key={g} value={g}>
+                      {g} mm
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="ws-check">
+                <input type="checkbox" checked={d.snapOn} onChange={(e) => setDoc((p) => ({ ...p, snapOn: e.target.checked }))} />
+                Snap activado
+              </label>
+              <div className="ws-hint">
+                <b>Atajos:</b> L línea · R rectángulo · C círculo · A arco · P polígono · G perfil · S soldadura · T texto · D cota · F flecha · H mano (desplazar) · Supr borrar · Ctrl+Z/Y deshacer/rehacer · Ctrl+S guardar · Ctrl+D duplicar
+              </div>
+            </>
+          )}
+          {selected && <PropertiesPanel shape={selected} unit={d.unit} onChange={(patch) => updateShape(selected.id, patch)} onDelete={() => deleteShape(selected.id)} onDuplicate={duplicateSelected} />}
+        </div>
+      </div>
+
+      {(mobileToolbarOpen || mobilePropsOpen) && (
+        <div
+          className="ws-overlay"
+          onClick={() => {
+            setMobileToolbarOpen(false);
+            setMobilePropsOpen(false);
+          }}
+        />
+      )}
+
+      {/* STATUS BAR */}
+      <div className="ws-statusbar">
+        <span>Herramienta: {toolLabel(tool)}</span>
+        <span>
+          X {round(cursorWorld.x, 1)} · Y {round(cursorWorld.y, 1)} {UNIT_LABEL[d.unit]}
+        </span>
+        <span>Zoom {round(viewport.scale * 100, 0)}%</span>
+        <span>Grid {d.gridSize} mm</span>
+        <span>Snap {d.snapOn ? "on" : "off"}</span>
+        <span className="ws-savestate">{saveStatus}</span>
+      </div>
+
+      {modal && modal.type === "open" && (
+        <Modal title="Abrir boceto" onClose={() => setModal(null)}>
+          {projects.length === 0 && <p className="ws-muted">No hay bocetos guardados todavía.</p>}
+          <ul className="ws-projlist">
+            {projects.map((p) => (
+              <li key={p.id}>
+                <button className="ws-projitem" onClick={() => openProject(p)}>
+                  <span>{p.name}</span>
+                  <small>{new Date(p.updatedAt).toLocaleString()}</small>
+                </button>
+                <button className="ws-projdel" onClick={() => deleteProject(p)} title="Eliminar">
+                  ✕
+                </button>
+              </li>
+            ))}
+          </ul>
+        </Modal>
+      )}
+      {modal && modal.type === "save" && <SaveModal defaultName={modal.name} onCancel={() => setModal(null)} onConfirm={confirmSaveAs} />}
+    </div>
+  );
+}
+
+/* =========================================================================
+   Sub-components
+   ========================================================================= */
+
+function toolLabel(t) {
+  return { select: "Seleccionar", mano: "Mano (desplazar)", line: "Línea", rect: "Rectángulo", circle: "Círculo", arc: "Arco", polygon: "Polígono", perfil: "Perfil", texto: "Texto", cota: "Cota", arrow: "Flecha", weld: "Soldadura", borrar: "Borrar" }[t] || t;
+}
+
+function ToolBtn({ active, label, hint, onClick, icon }) {
+  return (
+    <button className={`ws-tool ${active ? "on" : ""}`} onClick={onClick} title={`${label}${hint ? " (" + hint + ")" : ""}`}>
+      <ToolIcon icon={icon} />
+      <span>{label}</span>
+    </button>
+  );
+}
+
+function ToolIcon({ icon }) {
+  const common = { width: 17, height: 17, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round", strokeLinejoin: "round" };
+  switch (icon) {
+    case "cursor":
+      return (
+        <svg {...common}>
+          <path d="M5 3 L19 12 L12 13 L10 20 Z" />
+        </svg>
+      );
+    case "line":
+      return (
+        <svg {...common}>
+          <line x1="4" y1="20" x2="20" y2="4" />
+        </svg>
+      );
+    case "rect":
+      return (
+        <svg {...common}>
+          <rect x="4" y="6" width="16" height="12" />
+        </svg>
+      );
+    case "circle":
+      return (
+        <svg {...common}>
+          <circle cx="12" cy="12" r="8" />
+        </svg>
+      );
+    case "arc":
+      return (
+        <svg {...common}>
+          <path d="M4 18 A14 14 0 0 1 20 6" />
+        </svg>
+      );
+    case "polygon":
+      return (
+        <svg {...common}>
+          <path d="M12 3 L21 9 L18 20 L6 20 L3 9 Z" />
+        </svg>
+      );
+    case "profile":
+      return (
+        <svg {...common}>
+          <path d="M5 4 H19 V9 H10 V20 H5 Z" />
+        </svg>
+      );
+    case "text":
+      return (
+        <svg {...common}>
+          <path d="M5 5 H19 M12 5 V19" />
+        </svg>
+      );
+    case "dim":
+      return (
+        <svg {...common}>
+          <path d="M4 8 V4 M20 8 V4 M4 6 H20 M4 18 L8 14 M4 18 L8 22" />
+        </svg>
+      );
+    case "arrow":
+      return (
+        <svg {...common}>
+          <path d="M4 20 L20 4 M20 4 L12 4 M20 4 L20 12" />
+        </svg>
+      );
+    case "weld":
+      return (
+        <svg {...common}>
+          <path d="M3 17 H21 M3 17 L3 11 L9 17 Z M13 17 L21 5" />
+        </svg>
+      );
+    case "hand":
+      return (
+        <svg {...common}>
+          <path d="M8 13 V6 a1.5 1.5 0 0 1 3 0 v6 M11 12 V4.5 a1.5 1.5 0 0 1 3 0 V12 M14 12 V6 a1.5 1.5 0 0 1 3 0 v8 c0 3.3-2.2 6-6 6 h-1 c-2 0-3-.6-4.2-2.2 L4.6 15 a1.4 1.4 0 0 1 2-2 L8 14.5" />
+        </svg>
+      );
+    case "trash":
+      return (
+        <svg {...common}>
+          <path d="M5 7 H19 M9 7 V4 H15 V7 M7 7 L8 21 H16 L17 7" />
+        </svg>
+      );
+    default:
+      return null;
+  }
+}
+
+function GridLines({ gridSize, viewport, svgRef }) {
+  const rect = svgRef.current ? svgRef.current.getBoundingClientRect() : { width: 1000, height: 700 };
+  const worldMinX = -viewport.ox / viewport.scale;
+  const worldMinY = -viewport.oy / viewport.scale;
+  const worldMaxX = worldMinX + rect.width / viewport.scale;
+  const worldMaxY = worldMinY + rect.height / viewport.scale;
+  const lines = [];
+  const startX = Math.floor(worldMinX / gridSize) * gridSize;
+  const startY = Math.floor(worldMinY / gridSize) * gridSize;
+  for (let x = startX; x <= worldMaxX; x += gridSize) lines.push(<line key={"v" + x} x1={x} y1={worldMinY} x2={x} y2={worldMaxY} className="ws-grid" />);
+  for (let y = startY; y <= worldMaxY; y += gridSize) lines.push(<line key={"h" + y} x1={worldMinX} y1={y} x2={worldMaxX} y2={y} className="ws-grid" />);
+  return <g strokeWidth={1 / viewport.scale}>{lines}</g>;
+}
+
+function Handle({ p, onPointerDown, kind = "sq" }) {
+  const s = 4;
+  return kind === "sq" ? (
+    <rect x={p.x - s} y={p.y - s} width={s * 2} height={s * 2} className="ws-handle" onPointerDown={onPointerDown} />
+  ) : (
+    <circle cx={p.x} cy={p.y} r={s} className="ws-handle" onPointerDown={onPointerDown} />
+  );
+}
+
+/* Tipos de figura para las que generamos cotas automáticas (una por cada
+   lado relevante) directamente sobre el lienzo, además del panel. */
+const MEASURABLE_TYPES = new Set(["line", "arrow", "rect", "profile", "circle", "arc", "polygon"]);
+const COTA_SIDE_LABELS = { top: "Ancho (cota superior)", right: "Alto (cota lateral)", length: "Longitud", diameter: "Diámetro", radius: "Radio" };
+
+/* Caja delimitadora en mm de una figura, usando los mismos puntos clave
+   que ya usa el snap/zoom-a-selección. */
+function shapeBounds(s) {
+  const pts = shapeSnapPoints(s);
+  if (!pts.length) return null;
+  return {
+    minX: Math.min(...pts.map((p) => p.x)),
+    maxX: Math.max(...pts.map((p) => p.x)),
+    minY: Math.min(...pts.map((p) => p.y)),
+    maxY: Math.max(...pts.map((p) => p.y)),
+  };
+}
+
+/* Decide de qué lado (arriba/abajo o izquierda/derecha) debe quedar una
+   cota horizontal o vertical para no cruzar por encima de las figuras
+   cercanas al segmento medido. Devuelve -1 o 1 (signo del offset). */
+function pickDimSide(p1, p2, kind, shapes) {
+  const pad = 60;
+  const minX = Math.min(p1.x, p2.x) - pad,
+    maxX = Math.max(p1.x, p2.x) + pad;
+  const minY = Math.min(p1.y, p2.y) - pad,
+    maxY = Math.max(p1.y, p2.y) + pad;
+  const near = shapes
+    .filter((sh) => MEASURABLE_TYPES.has(sh.type))
+    .map((sh) => shapeBounds(sh))
+    .filter((b) => b && b.maxX >= minX && b.minX <= maxX && b.maxY >= minY && b.minY <= maxY);
+  if (kind === "horizontal") {
+    if (!near.length) return -1;
+    const segY = Math.min(p1.y, p2.y);
+    const avgCenterY = near.reduce((sum, b) => sum + (b.minY + b.maxY) / 2, 0) / near.length;
+    return avgCenterY >= segY ? -1 : 1;
+  }
+  if (!near.length) return 1;
+  const segX = Math.max(p1.x, p2.x);
+  const avgCenterX = near.reduce((sum, b) => sum + (b.minX + b.maxX) / 2, 0) / near.length;
+  return avgCenterX <= segX ? 1 : -1;
+}
+
+/* Construye una cota tipo "línea con líneas de extensión y flechas de tope",
+   igual que las cotas manuales (herramienta Cota), para un lado de la caja
+   delimitadora ("top" = ancho arriba, "right" = alto a la derecha). */
+function bboxCotas(b, s, unit, ext) {
+  const ov = s.cotas || {};
+  const cu = s.cotaUnits || {};
+  const topLabel = (ov.top || "").trim() || fmt(b.maxX - b.minX, cu.top || unit);
+  const rightLabel = (ov.right || "").trim() || fmt(b.maxY - b.minY, cu.right || unit);
+  const topY = b.minY - ext * 0.6;
+  const rightX = b.maxX + ext * 0.6;
+  return [
+    {
+      side: "top",
+      kind: "plain",
+      label: topLabel,
+      textPos: { x: (b.minX + b.maxX) / 2, y: topY },
+      rotDeg: 0,
+    },
+    {
+      side: "right",
+      kind: "plain",
+      label: rightLabel,
+      textPos: { x: rightX, y: (b.minY + b.maxY) / 2 },
+      rotDeg: -90,
+    },
+  ];
+}
+
+/* Cota paralela desplazada de la línea/flecha, mostrando su longitud. */
+function lineCota(s, unit, ext) {
+  const a = s.p1,
+    b = s.p2;
+  const dx = b.x - a.x,
+    dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len,
+    ny = dx / len;
+  const m = mid(a, b);
+  const textPos = { x: m.x + nx * ext * 0.6, y: m.y + ny * ext * 0.6 };
+  const ov = ((s.cotas || {}).length || "").trim();
+  const label = ov || fmt(dist(a, b), (s.cotaUnits && s.cotaUnits.length) || unit);
+  let rotDeg = angleOf(a, b);
+  if (rotDeg > 90 || rotDeg < -90) rotDeg += 180;
+  return [
+    {
+      side: "length",
+      kind: "plain",
+      label,
+      textPos,
+      rotDeg,
+    },
+  ];
+}
+
+/* Cota horizontal bajo el círculo mostrando su diámetro. */
+function circleCota(s, unit, ext) {
+  const b = shapeBounds(s);
+  const y = b.maxY + ext * 0.6;
+  const ov = ((s.cotas || {}).diameter || "").trim();
+  const label = ov || "⌀" + fmt(s.radius * 2, (s.cotaUnits && s.cotaUnits.diameter) || unit);
+  return [
+    {
+      side: "diameter",
+      kind: "plain",
+      label,
+      textPos: { x: (b.minX + b.maxX) / 2, y },
+      rotDeg: 0,
+    },
+  ];
+}
+
+/* Línea líder desde el centro del arco mostrando su radio. */
+function arcCota(s, unit, ext) {
+  const midAngle = (s.start + s.end) / 2;
+  const tip = arcPoint(s.center, s.radius + ext, midAngle);
+  const ov = ((s.cotas || {}).radius || "").trim();
+  const label = ov || "R" + fmt(s.radius, (s.cotaUnits && s.cotaUnits.radius) || unit);
+  return [{ side: "radius", kind: "leader", label, leader: { from: s.center, to: tip }, textPos: tip }];
+}
+
+/* Devuelve las cotas automáticas (una por lado) de una figura medible.
+   ext es la distancia (en mm de mundo) entre la figura y la línea de cota. */
+function computeAutoCotas(s, unit, ext = 6) {
+  switch (s.type) {
+    case "rect":
+    case "profile":
+    case "polygon": {
+      const b = shapeBounds(s);
+      return b ? bboxCotas(b, s, unit, ext) : [];
+    }
+    case "line":
+    case "arrow":
+      return lineCota(s, unit, ext);
+    case "circle":
+      return circleCota(s, unit, ext);
+    case "arc":
+      return arcCota(s, unit, ext);
+    default:
+      return [];
+  }
+}
+
+function dimLabel(s, unit) {
+  if (s.overrideText) return s.overrideText;
+  const u = s.unit || unit || "mm";
+  if (s.kind === "horizontal") return fmt(Math.abs(s.p2.x - s.p1.x), u);
+  if (s.kind === "vertical") return fmt(Math.abs(s.p2.y - s.p1.y), u);
+  if (s.kind === "diagonal") return fmt(dist(s.p1, s.p2), u);
+  if (s.kind === "diametro") return "Ø" + fmt(dist(s.p1, s.p2), u);
+  if (s.kind === "radio") return "R" + fmt(dist(s.p1, s.p2), u);
+  if (s.kind === "angulo") {
+    const a1 = angleOf(s.p1, s.p2);
+    const a2 = angleOf(s.p1, s.p3);
+    let diff = Math.abs(a1 - a2);
+    if (diff > 180) diff = 360 - diff;
+    return round(diff, 1) + "°";
+  }
+  return "";
+}
+function dimLabelPos(s) {
+  if (s.kind === "angulo") {
+    const a1 = angleOf(s.p1, s.p2);
+    const a2 = angleOf(s.p1, s.p3);
+    const mAng = rad((a1 + a2) / 2);
+    return { x: s.p1.x + 30 * Math.cos(mAng), y: s.p1.y + 30 * Math.sin(mAng) };
+  }
+  if (s.kind === "horizontal") return { x: (s.p1.x + s.p2.x) / 2, y: Math.min(s.p1.y, s.p2.y) + s.offset };
+  if (s.kind === "vertical") return { x: Math.max(s.p1.x, s.p2.x) + s.offset, y: (s.p1.y + s.p2.y) / 2 };
+  const a = s.p1,
+    b = s.p2;
+  const dx = b.x - a.x,
+    dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len,
+    ny = dx / len;
+  return { x: (a.x + b.x) / 2 + nx * s.offset, y: (a.y + b.y) / 2 + ny * s.offset };
+}
+
+/* Dibuja una cota automática (línea de cota + líneas de extensión + texto,
+   o línea líder para radios) de forma interactiva, con doble clic para editar. */
+function AutoCotaShape({ desc, color, scale, onDoubleClick }) {
+  const fontSize = 10 / scale;
+  const sw = 1 / scale;
+  const groupProps = {
+    className: "ws-autocota",
+    onDoubleClick,
+    onPointerDown: (e) => e.stopPropagation(),
+    style: { cursor: "text" },
+  };
+  if (desc.kind === "leader") {
+    return (
+      <g {...groupProps}>
+        <line x1={desc.leader.from.x} y1={desc.leader.from.y} x2={desc.leader.to.x} y2={desc.leader.to.y} stroke={color} strokeWidth={sw} />
+        <text x={desc.textPos.x} y={desc.textPos.y} fontSize={fontSize} fontFamily="'IBM Plex Mono',monospace" fill={color} textAnchor="middle" dominantBaseline="middle" className="ws-measurelabel">
+          {desc.label}
+        </text>
+      </g>
+    );
+  }
+  if (desc.kind === "plain") {
+    const rot = desc.rotDeg || 0;
+    return (
+      <g {...groupProps}>
+        <text
+          x={desc.textPos.x}
+          y={desc.textPos.y}
+          fontSize={fontSize}
+          fontFamily="'IBM Plex Mono',monospace"
+          fill={color}
+          textAnchor="middle"
+          dominantBaseline="middle"
+          transform={rot ? `rotate(${rot} ${desc.textPos.x} ${desc.textPos.y})` : undefined}
+          className="ws-measurelabel ws-measurelabel-plain"
+        >
+          {desc.label}
+        </text>
+      </g>
+    );
+  }
+  const tickLen = 5 / scale;
+  const dLen = dist(desc.a, desc.bpt) || 1;
+  const ux = (desc.bpt.x - desc.a.x) / dLen,
+    uy = (desc.bpt.y - desc.a.y) / dLen;
+  const m = mid(desc.a, desc.bpt);
+  const gap = Math.max(desc.label.length * fontSize * 0.3, fontSize * 0.6) + 2 / scale;
+  const gA = { x: m.x - ux * gap, y: m.y - uy * gap };
+  const gB = { x: m.x + ux * gap, y: m.y + uy * gap };
+  const tA = tickAt(desc.a, desc.dirDeg, tickLen);
+  const tB = tickAt(desc.bpt, desc.dirDeg, tickLen);
+  return (
+    <g {...groupProps}>
+      {desc.extLines.map((l, i) => (
+        <line key={i} x1={l.x1} y1={l.y1} x2={l.x2} y2={l.y2} stroke={color} strokeWidth={sw} strokeDasharray={`${1.5 / scale},${1.5 / scale}`} opacity="0.55" />
+      ))}
+      <line x1={desc.a.x} y1={desc.a.y} x2={gA.x} y2={gA.y} stroke={color} strokeWidth={sw * 1.3} />
+      <line x1={gB.x} y1={gB.y} x2={desc.bpt.x} y2={desc.bpt.y} stroke={color} strokeWidth={sw * 1.3} />
+      <line x1={tA.x1} y1={tA.y1} x2={tA.x2} y2={tA.y2} stroke={color} strokeWidth={sw * 1.6} />
+      <line x1={tB.x1} y1={tB.y1} x2={tB.x2} y2={tB.y2} stroke={color} strokeWidth={sw * 1.6} />
+      <text x={m.x} y={m.y} dominantBaseline="middle" textAnchor="middle" fontSize={fontSize} fontFamily="'IBM Plex Mono',monospace" fill={color} className="ws-measurelabel">
+        {desc.label}
+      </text>
+    </g>
+  );
+}
+
+/* Renders one shape, either interactive (with selection handles) or static (export) */
+function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, onPointerDownHandle, onDoubleClick, onCotaDoubleClick }) {
+  const stroke = s.color;
+  const sw = 1.6 / scale;
+  const interactiveProps = { onPointerDown: onPointerDownShape, onDoubleClick, style: { cursor: tool === "borrar" ? "not-allowed" : tool === "select" ? "move" : "crosshair" } };
+
+  let body = null;
+  switch (s.type) {
+    case "line":
+      body = <line x1={s.p1.x} y1={s.p1.y} x2={s.p2.x} y2={s.p2.y} stroke={stroke} strokeWidth={sw} {...interactiveProps} />;
+      break;
+    case "arrow":
+      body = <line x1={s.p1.x} y1={s.p1.y} x2={s.p2.x} y2={s.p2.y} stroke={stroke} strokeWidth={sw * 1.2} markerEnd="url(#arrowend)" {...interactiveProps} />;
+      break;
+    case "rect": {
+      const x = Math.min(s.p1.x, s.p2.x),
+        y = Math.min(s.p1.y, s.p2.y);
+      const w = Math.abs(s.p2.x - s.p1.x),
+        h = Math.abs(s.p2.y - s.p1.y);
+      body = <rect x={x} y={y} width={w} height={h} fill="none" stroke={stroke} strokeWidth={sw} {...interactiveProps} />;
+      break;
+    }
+    case "profile": {
+      const loops = profileOutline(s);
+      body = (
+        <path
+          d={loopsToPathD(loops)}
+          fill="none"
+          stroke={stroke}
+          strokeWidth={sw}
+          strokeLinejoin="round"
+          transform={profileTransform(s)}
+          {...interactiveProps}
+        />
+      );
+      break;
+    }
+    case "circle":
+      body = <circle cx={s.center.x} cy={s.center.y} r={s.radius} fill="none" stroke={stroke} strokeWidth={sw} {...interactiveProps} />;
+      break;
+    case "arc":
+      body = <path d={arcPath(s.center, s.radius, s.start, s.end)} fill="none" stroke={stroke} strokeWidth={sw} {...interactiveProps} />;
+      break;
+    case "polygon":
+      body = <polygon points={s.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={stroke} strokeWidth={sw} {...interactiveProps} />;
+      break;
+    case "text":
+      body = (
+        <text x={s.pos.x} y={s.pos.y} fontSize={s.size} fill={stroke} fontFamily="'IBM Plex Sans',sans-serif" transform={s.rotation ? `rotate(${s.rotation} ${s.pos.x} ${s.pos.y})` : undefined} {...interactiveProps}>
+          {s.text}
+        </text>
+      );
+      break;
+    case "dimension":
+      body = <DimensionShape s={s} unit={unit} scale={scale} interactiveProps={interactiveProps} />;
+      break;
+    case "weld":
+      body = <WeldSymbolShape s={s} scale={scale} interactiveProps={interactiveProps} />;
+      break;
+    default:
+      body = null;
+  }
+
+  const handles = selected && tool === "select" ? getHandles(s).map((h, i) => <Handle key={i} p={h.p} kind={h.kind} onPointerDown={(e) => onPointerDownHandle(e, h.key)} />) : null;
+
+  let cotaEls = null;
+  if (MEASURABLE_TYPES.has(s.type) && s.showMeasure === true) {
+    const ext = 14 / scale;
+    cotaEls = computeAutoCotas(s, unit, ext).map((desc) => (
+      <AutoCotaShape
+        key={desc.side}
+        desc={desc}
+        color={stroke}
+        scale={scale}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          onCotaDoubleClick && onCotaDoubleClick(s, desc);
+        }}
+      />
+    ));
+  }
+
+  return (
+    <g className={selected ? "ws-shape selected" : "ws-shape"}>
+      {body}
+      {cotaEls}
+      {handles}
+    </g>
+  );
+}
+
+function getHandles(s) {
+  switch (s.type) {
+    case "line":
+    case "arrow":
+      return [
+        { key: "p1", p: s.p1 },
+        { key: "p2", p: s.p2 },
+      ];
+    case "weld":
+      return [
+        { key: "p1", p: s.p1, kind: "circle" },
+        { key: "p2", p: s.p2 },
+      ];
+    case "rect":
+    case "profile":
+      return [
+        { key: "p1", p: s.p1 },
+        { key: "p2", p: s.p2 },
+      ];
+    case "circle":
+      return [{ key: "r", p: { x: s.center.x + s.radius, y: s.center.y }, kind: "circle" }];
+    case "arc":
+      return [
+        { key: "center", p: s.center, kind: "circle" },
+        { key: "start", p: arcPoint(s.center, s.radius, s.start) },
+        { key: "end", p: arcPoint(s.center, s.radius, s.end) },
+      ];
+    case "polygon":
+      return s.points.map((p, i) => ({ key: i, p }));
+    case "text":
+      return [{ key: "pos", p: s.pos, kind: "circle" }];
+    case "dimension":
+      return [
+        { key: "p1", p: s.p1 },
+        { key: "p2", p: s.p2 },
+        { key: "offset", p: dimLabelPos(s), kind: "circle" },
+      ];
+    default:
+      return [];
+  }
+}
+
+function DimensionShape({ s, unit, scale, interactiveProps }) {
+  const sw = 1 / scale;
+  const label = dimLabel(s, unit);
+  const labelPos = dimLabelPos(s);
+
+  if (s.kind === "angulo") {
+    const r = 26;
+    const a1 = angleOf(s.p1, s.p2);
+    const a2 = angleOf(s.p1, s.p3);
+    return (
+      <g stroke={s.color} fill={s.color} {...interactiveProps}>
+        <line x1={s.p1.x} y1={s.p1.y} x2={s.p2.x} y2={s.p2.y} strokeWidth={sw} strokeDasharray={`${2 / scale},${2 / scale}`} />
+        <line x1={s.p1.x} y1={s.p1.y} x2={s.p3.x} y2={s.p3.y} strokeWidth={sw} strokeDasharray={`${2 / scale},${2 / scale}`} />
+        <path d={arcPath(s.p1, r, a1, a2)} fill="none" strokeWidth={sw} />
+        <text x={labelPos.x} y={labelPos.y} fontSize={12 / scale} fontFamily="'IBM Plex Mono',monospace" stroke="none">
+          {label}
+        </text>
+      </g>
+    );
+  }
+
+  if (s.kind === "horizontal" || s.kind === "vertical") {
+    const isH = s.kind === "horizontal";
+    const dimLine = isH ? Math.min(s.p1.y, s.p2.y) + s.offset : Math.max(s.p1.x, s.p2.x) + s.offset;
+    const a = isH ? { x: s.p1.x, y: dimLine } : { x: dimLine, y: s.p1.y };
+    const b = isH ? { x: s.p2.x, y: dimLine } : { x: dimLine, y: s.p2.y };
+    const dirDeg = angleOf(a, b);
+    const m = mid(a, b);
+    const fontSize = 12 / scale;
+    const tickLen = 6 / scale;
+    const dLen = dist(a, b) || 1;
+    const ux = (b.x - a.x) / dLen,
+      uy = (b.y - a.y) / dLen;
+    const gap = Math.max(label.length * fontSize * 0.3, fontSize * 0.6) + 2 / scale;
+    const gA = { x: m.x - ux * gap, y: m.y - uy * gap };
+    const gB = { x: m.x + ux * gap, y: m.y + uy * gap };
+    const tA = tickAt(a, dirDeg, tickLen);
+    const tB = tickAt(b, dirDeg, tickLen);
+    return (
+      <g stroke={s.color} fill={s.color} {...interactiveProps}>
+        <line x1={s.p1.x} y1={s.p1.y} x2={a.x} y2={a.y} strokeWidth={sw} />
+        <line x1={s.p2.x} y1={s.p2.y} x2={b.x} y2={b.y} strokeWidth={sw} />
+        <line x1={a.x} y1={a.y} x2={gA.x} y2={gA.y} strokeWidth={sw * 1.4} />
+        <line x1={gB.x} y1={gB.y} x2={b.x} y2={b.y} strokeWidth={sw * 1.4} />
+        <line x1={tA.x1} y1={tA.y1} x2={tA.x2} y2={tA.y2} strokeWidth={sw * 1.8} />
+        <line x1={tB.x1} y1={tB.y1} x2={tB.x2} y2={tB.y2} strokeWidth={sw * 1.8} />
+        <text x={m.x} y={m.y} dominantBaseline="middle" fontSize={fontSize} textAnchor="middle" fontFamily="'IBM Plex Mono',monospace" stroke="none">
+          {label}
+        </text>
+      </g>
+    );
+  }
+
+  // diagonal / diametro / radio
+  const a = s.p1,
+    b = s.p2;
+  const dx = b.x - a.x,
+    dy = b.y - a.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len,
+    ny = dx / len;
+  const off = s.offset;
+  const a2 = { x: a.x + nx * off, y: a.y + ny * off };
+  const b2 = { x: b.x + nx * off, y: b.y + ny * off };
+  const dirDeg2 = angleOf(a2, b2);
+  const m2 = mid(a2, b2);
+  const fontSize2 = 12 / scale;
+  const tickLen2 = 6 / scale;
+  const dLen2 = dist(a2, b2) || 1;
+  const ux2 = (b2.x - a2.x) / dLen2,
+    uy2 = (b2.y - a2.y) / dLen2;
+  const gap2 = Math.max(label.length * fontSize2 * 0.3, fontSize2 * 0.6) + 2 / scale;
+  const gA2 = { x: m2.x - ux2 * gap2, y: m2.y - uy2 * gap2 };
+  const gB2 = { x: m2.x + ux2 * gap2, y: m2.y + uy2 * gap2 };
+  const tA2 = tickAt(a2, dirDeg2, tickLen2);
+  const tB2 = tickAt(b2, dirDeg2, tickLen2);
+  return (
+    <g stroke={s.color} fill={s.color} {...interactiveProps}>
+      <line x1={a.x} y1={a.y} x2={a2.x} y2={a2.y} strokeWidth={sw} />
+      <line x1={b.x} y1={b.y} x2={b2.x} y2={b2.y} strokeWidth={sw} />
+      <line x1={a2.x} y1={a2.y} x2={gA2.x} y2={gA2.y} strokeWidth={sw * 1.4} />
+      <line x1={gB2.x} y1={gB2.y} x2={b2.x} y2={b2.y} strokeWidth={sw * 1.4} />
+      <line x1={tA2.x1} y1={tA2.y1} x2={tA2.x2} y2={tA2.y2} strokeWidth={sw * 1.8} />
+      <line x1={tB2.x1} y1={tB2.y1} x2={tB2.x2} y2={tB2.y2} strokeWidth={sw * 1.8} />
+      <text x={m2.x} y={m2.y} dominantBaseline="middle" fontSize={fontSize2} textAnchor="middle" fontFamily="'IBM Plex Mono',monospace" stroke="none">
+        {label}
+      </text>
+    </g>
+  );
+}
+
+function WeldSymbolShape({ s, scale, interactiveProps }) {
+  const sw = 1.4 / scale;
+  const g = weldGeom(s);
+  const fontSize = 11 / scale;
+  return (
+    <g stroke={s.color} fill="none" {...interactiveProps}>
+      <line x1={g.leader.x1} y1={g.leader.y1} x2={g.leader.x2} y2={g.leader.y2} strokeWidth={sw} markerEnd="url(#arrowend)" />
+      <line x1={g.ref.x1} y1={g.ref.y1} x2={g.ref.x2} y2={g.ref.y2} strokeWidth={sw} />
+      {g.glyphs.map((gl, i) => {
+        if (gl.kind === "polygon") return <polygon key={i} points={gl.points.map((p) => `${p.x},${p.y}`).join(" ")} strokeWidth={sw} strokeLinejoin="round" />;
+        if (gl.kind === "circle") return <circle key={i} cx={gl.cx} cy={gl.cy} r={gl.r} strokeWidth={sw} />;
+        if (gl.kind === "rect") return <rect key={i} x={gl.x} y={gl.y} width={gl.w} height={gl.h} strokeWidth={sw} />;
+        if (gl.kind === "lines")
+          return (
+            <g key={i}>
+              {gl.lines.map((ln, j) => (
+                <line key={j} x1={ln.x1} y1={ln.y1} x2={ln.x2} y2={ln.y2} strokeWidth={sw} />
+              ))}
+            </g>
+          );
+        return null;
+      })}
+      {g.allAround && <circle cx={g.allAround.cx} cy={g.allAround.cy} r={g.allAround.r} strokeWidth={sw} />}
+      {g.campo && <polygon points={g.campo.points.map((p) => `${p.x},${p.y}`).join(" ")} fill={s.color} stroke="none" />}
+      {s.size && (
+        <text x={g.sizePos.x} y={g.sizePos.y} fontSize={fontSize} textAnchor={g.sizePos.anchor} fontFamily="'IBM Plex Mono',monospace" stroke="none" fill={s.color}>
+          {s.size}
+        </text>
+      )}
+      {s.tail && (
+        <text x={g.tailPos.x} y={g.tailPos.y} dominantBaseline="middle" fontSize={fontSize} textAnchor={g.tailPos.anchor} fontFamily="'IBM Plex Mono',monospace" stroke="none" fill={s.color}>
+          {s.tail}
+        </text>
+      )}
+    </g>
+  );
+}
+
+/* Versión estática (cadena SVG) de una cota automática, usada al exportar. */
+function renderCotaDescriptorStatic(desc, color) {
+  if (desc.kind === "leader") {
+    return `<line x1="${desc.leader.from.x}" y1="${desc.leader.from.y}" x2="${desc.leader.to.x}" y2="${desc.leader.to.y}" stroke="${color}" stroke-width="0.4"/><text x="${desc.textPos.x}" y="${desc.textPos.y}" font-size="3.2" font-family="'IBM Plex Mono',monospace" fill="${color}" text-anchor="middle" dominant-baseline="middle">${escapeXml(desc.label)}</text>`;
+  }
+  if (desc.kind === "plain") {
+    const rot = desc.rotDeg || 0;
+    const transformAttr = rot ? ` transform="rotate(${rot} ${desc.textPos.x} ${desc.textPos.y})"` : "";
+    return `<text x="${desc.textPos.x}" y="${desc.textPos.y}" font-size="3.2" font-family="'IBM Plex Mono',monospace" fill="${color}" text-anchor="middle" dominant-baseline="middle"${transformAttr}>${escapeXml(desc.label)}</text>`;
+  }
+  const fontSize = 3.2,
+    tickLen = 2;
+  const dLen = dist(desc.a, desc.bpt) || 1;
+  const ux = (desc.bpt.x - desc.a.x) / dLen,
+    uy = (desc.bpt.y - desc.a.y) / dLen;
+  const m = mid(desc.a, desc.bpt);
+  const gap = Math.max(desc.label.length * fontSize * 0.3, fontSize * 0.6) + 1;
+  const gA = { x: m.x - ux * gap, y: m.y - uy * gap };
+  const gB = { x: m.x + ux * gap, y: m.y + uy * gap };
+  const tA = tickAt(desc.a, desc.dirDeg, tickLen);
+  const tB = tickAt(desc.bpt, desc.dirDeg, tickLen);
+  let out = "";
+  desc.extLines.forEach((l) => {
+    out += `<line x1="${l.x1}" y1="${l.y1}" x2="${l.x2}" y2="${l.y2}" stroke="${color}" stroke-width="0.3" stroke-dasharray="1,1" opacity="0.55"/>`;
+  });
+  out += `<line x1="${desc.a.x}" y1="${desc.a.y}" x2="${gA.x}" y2="${gA.y}" stroke="${color}" stroke-width="0.35"/>`;
+  out += `<line x1="${gB.x}" y1="${gB.y}" x2="${desc.bpt.x}" y2="${desc.bpt.y}" stroke="${color}" stroke-width="0.35"/>`;
+  out += `<line x1="${tA.x1}" y1="${tA.y1}" x2="${tA.x2}" y2="${tA.y2}" stroke="${color}" stroke-width="0.4"/>`;
+  out += `<line x1="${tB.x1}" y1="${tB.y1}" x2="${tB.x2}" y2="${tB.y2}" stroke="${color}" stroke-width="0.4"/>`;
+  out += `<text x="${m.x}" y="${m.y}" font-size="${fontSize}" font-family="'IBM Plex Mono',monospace" fill="${color}" text-anchor="middle" dominant-baseline="middle">${escapeXml(desc.label)}</text>`;
+  return out;
+}
+
+/* static (non-interactive) render used only for export */
+function renderShapeStatic(s, unit = "mm") {
+  const stroke = s.color;
+  let measureSvg = "";
+  if (MEASURABLE_TYPES.has(s.type) && s.showMeasure === true) {
+    measureSvg = computeAutoCotas(s, unit, 6)
+      .map((desc) => renderCotaDescriptorStatic(desc, stroke))
+      .join("");
+  }
+  switch (s.type) {
+    case "line":
+      return `<line x1="${s.p1.x}" y1="${s.p1.y}" x2="${s.p2.x}" y2="${s.p2.y}" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
+    case "arrow":
+      return `<line x1="${s.p1.x}" y1="${s.p1.y}" x2="${s.p2.x}" y2="${s.p2.y}" stroke="${stroke}" stroke-width="1.2" marker-end="url(#arrowend)" />${measureSvg}`;
+    case "rect": {
+      const x = Math.min(s.p1.x, s.p2.x),
+        y = Math.min(s.p1.y, s.p2.y);
+      const w = Math.abs(s.p2.x - s.p1.x),
+        h = Math.abs(s.p2.y - s.p1.y);
+      return `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="none" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
+    }
+    case "profile": {
+      const loops = profileOutline(s);
+      return `<path d="${loopsToPathD(loops)}" fill="none" stroke="${stroke}" stroke-width="1" stroke-linejoin="round" transform="${profileTransform(s)}" />${measureSvg}`;
+    }
+    case "circle":
+      return `<circle cx="${s.center.x}" cy="${s.center.y}" r="${s.radius}" fill="none" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
+    case "arc":
+      return `<path d="${arcPath(s.center, s.radius, s.start, s.end)}" fill="none" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
+    case "polygon":
+      return `<polygon points="${s.points.map((p) => `${p.x},${p.y}`).join(" ")}" fill="none" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
+    case "text":
+      return `<text x="${s.pos.x}" y="${s.pos.y}" font-size="${s.size}" fill="${stroke}" font-family="sans-serif"${s.rotation ? ` transform="rotate(${s.rotation} ${s.pos.x} ${s.pos.y})"` : ""}>${escapeXml(s.text)}</text>`;
+    case "dimension":
+      return renderDimensionStatic(s, unit);
+    case "weld":
+      return renderWeldStatic(s);
+    default:
+      return "";
+  }
+}
+function escapeXml(t) {
+  return String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function renderDimensionStatic(s, unit) {
+  const label = dimLabel(s, unit);
+  const labelPos = dimLabelPos(s);
+  const fontSize = 4;
+  const tickLen = 2.2;
+  const tickSvg = (p, dirDeg) => {
+    const t = tickAt(p, dirDeg, tickLen);
+    return `<line x1="${t.x1}" y1="${t.y1}" x2="${t.x2}" y2="${t.y2}" stroke="${s.color}" stroke-width="0.6"/>`;
+  };
+  let lines = "";
+  let textX = labelPos.x,
+    textY = labelPos.y - 1,
+    dominant = false;
+  if (s.kind === "angulo") {
+    const a1 = angleOf(s.p1, s.p2);
+    const a2 = angleOf(s.p1, s.p3);
+    lines = `<line x1="${s.p1.x}" y1="${s.p1.y}" x2="${s.p2.x}" y2="${s.p2.y}" stroke="${s.color}" stroke-width="0.5" stroke-dasharray="2,2"/><line x1="${s.p1.x}" y1="${s.p1.y}" x2="${s.p3.x}" y2="${s.p3.y}" stroke="${s.color}" stroke-width="0.5" stroke-dasharray="2,2"/><path d="${arcPath(s.p1, 26, a1, a2)}" fill="none" stroke="${s.color}" stroke-width="0.5"/>`;
+  } else if (s.kind === "horizontal" || s.kind === "vertical") {
+    const isH = s.kind === "horizontal";
+    const dimLine = isH ? Math.min(s.p1.y, s.p2.y) + s.offset : Math.max(s.p1.x, s.p2.x) + s.offset;
+    const a = isH ? { x: s.p1.x, y: dimLine } : { x: dimLine, y: s.p1.y };
+    const b = isH ? { x: s.p2.x, y: dimLine } : { x: dimLine, y: s.p2.y };
+    const dirDeg = angleOf(a, b);
+    const m = mid(a, b);
+    const dLen = dist(a, b) || 1;
+    const ux = (b.x - a.x) / dLen,
+      uy = (b.y - a.y) / dLen;
+    const gap = Math.max(label.length * fontSize * 0.3, fontSize * 0.6) + 1;
+    const gA = { x: m.x - ux * gap, y: m.y - uy * gap };
+    const gB = { x: m.x + ux * gap, y: m.y + uy * gap };
+    lines = `<line x1="${s.p1.x}" y1="${s.p1.y}" x2="${a.x}" y2="${a.y}" stroke="${s.color}" stroke-width="0.3"/><line x1="${s.p2.x}" y1="${s.p2.y}" x2="${b.x}" y2="${b.y}" stroke="${s.color}" stroke-width="0.3"/><line x1="${a.x}" y1="${a.y}" x2="${gA.x}" y2="${gA.y}" stroke="${s.color}" stroke-width="0.4"/><line x1="${gB.x}" y1="${gB.y}" x2="${b.x}" y2="${b.y}" stroke="${s.color}" stroke-width="0.4"/>${tickSvg(a, dirDeg)}${tickSvg(b, dirDeg)}`;
+    textX = m.x;
+    textY = m.y;
+    dominant = true;
+  } else {
+    const a = s.p1,
+      b = s.p2;
+    const dx = b.x - a.x,
+      dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len,
+      ny = dx / len;
+    const off = s.offset;
+    const a2 = { x: a.x + nx * off, y: a.y + ny * off };
+    const b2 = { x: b.x + nx * off, y: b.y + ny * off };
+    const dirDeg = angleOf(a2, b2);
+    const m = mid(a2, b2);
+    const dLen = dist(a2, b2) || 1;
+    const ux = (b2.x - a2.x) / dLen,
+      uy = (b2.y - a2.y) / dLen;
+    const gap = Math.max(label.length * fontSize * 0.3, fontSize * 0.6) + 1;
+    const gA = { x: m.x - ux * gap, y: m.y - uy * gap };
+    const gB = { x: m.x + ux * gap, y: m.y + uy * gap };
+    lines = `<line x1="${a.x}" y1="${a.y}" x2="${a2.x}" y2="${a2.y}" stroke="${s.color}" stroke-width="0.3"/><line x1="${b.x}" y1="${b.y}" x2="${b2.x}" y2="${b2.y}" stroke="${s.color}" stroke-width="0.3"/><line x1="${a2.x}" y1="${a2.y}" x2="${gA.x}" y2="${gA.y}" stroke="${s.color}" stroke-width="0.4"/><line x1="${gB.x}" y1="${gB.y}" x2="${b2.x}" y2="${b2.y}" stroke="${s.color}" stroke-width="0.4"/>${tickSvg(a2, dirDeg)}${tickSvg(b2, dirDeg)}`;
+    textX = m.x;
+    textY = m.y;
+    dominant = true;
+  }
+  return `${lines}<text x="${textX}" y="${textY}" ${dominant ? 'dominant-baseline="middle" ' : ""}font-size="${fontSize}" text-anchor="middle" font-family="monospace" fill="${s.color}">${escapeXml(label)}</text>`;
+}
+function renderWeldStatic(s) {
+  const g = weldGeom(s);
+  const fontSize = 4;
+  let glyphSvg = "";
+  g.glyphs.forEach((gl) => {
+    if (gl.kind === "polygon") glyphSvg += `<polygon points="${gl.points.map((p) => `${p.x},${p.y}`).join(" ")}" fill="none" stroke="${s.color}" stroke-width="0.6" stroke-linejoin="round"/>`;
+    else if (gl.kind === "circle") glyphSvg += `<circle cx="${gl.cx}" cy="${gl.cy}" r="${gl.r}" fill="none" stroke="${s.color}" stroke-width="0.6"/>`;
+    else if (gl.kind === "rect") glyphSvg += `<rect x="${gl.x}" y="${gl.y}" width="${gl.w}" height="${gl.h}" fill="none" stroke="${s.color}" stroke-width="0.6"/>`;
+    else if (gl.kind === "lines") gl.lines.forEach((ln) => (glyphSvg += `<line x1="${ln.x1}" y1="${ln.y1}" x2="${ln.x2}" y2="${ln.y2}" stroke="${s.color}" stroke-width="0.6"/>`));
+  });
+  const allAroundSvg = g.allAround ? `<circle cx="${g.allAround.cx}" cy="${g.allAround.cy}" r="${g.allAround.r}" fill="none" stroke="${s.color}" stroke-width="0.6"/>` : "";
+  const campoSvg = g.campo ? `<polygon points="${g.campo.points.map((p) => `${p.x},${p.y}`).join(" ")}" fill="${s.color}" stroke="none"/>` : "";
+  const sizeSvg = s.size ? `<text x="${g.sizePos.x}" y="${g.sizePos.y}" font-size="${fontSize}" text-anchor="${g.sizePos.anchor}" font-family="monospace" fill="${s.color}">${escapeXml(s.size)}</text>` : "";
+  const tailSvg = s.tail ? `<text x="${g.tailPos.x}" y="${g.tailPos.y}" dominant-baseline="middle" font-size="${fontSize}" text-anchor="${g.tailPos.anchor}" font-family="monospace" fill="${s.color}">${escapeXml(s.tail)}</text>` : "";
+  return `<line x1="${g.leader.x1}" y1="${g.leader.y1}" x2="${g.leader.x2}" y2="${g.leader.y2}" stroke="${s.color}" stroke-width="0.7" marker-end="url(#arrowend)"/><line x1="${g.ref.x1}" y1="${g.ref.y1}" x2="${g.ref.x2}" y2="${g.ref.y2}" stroke="${s.color}" stroke-width="0.7"/>${glyphSvg}${allAroundSvg}${campoSvg}${sizeSvg}${tailSvg}`;
+}
+
+function DraftPreview({ draft, color, scale }) {
+  const sw = 1.4 / scale;
+  const dash = `${3 / scale},${3 / scale}`;
+  const pts = draft.points;
+  const cur = draft.cursor;
+  if (draft.tool === "line" || draft.tool === "arrow") {
+    const p2 = snapAngleDeg(pts[0], cur);
+    return <line x1={pts[0].x} y1={pts[0].y} x2={p2.x} y2={p2.y} stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+  }
+  if (draft.tool === "rect") {
+    const x = Math.min(pts[0].x, cur.x),
+      y = Math.min(pts[0].y, cur.y);
+    return <rect x={x} y={y} width={Math.abs(cur.x - pts[0].x)} height={Math.abs(cur.y - pts[0].y)} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+  }
+  if (draft.tool === "perfil") {
+    const loops = profileOutline({ p1: pts[0], p2: cur, profileType: draft.profileType || "angular", thickness: 5 });
+    return <path d={loopsToPathD(loops)} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={dash} strokeLinejoin="round" />;
+  }
+  if (draft.tool === "circle") {
+    return <circle cx={pts[0].x} cy={pts[0].y} r={dist(pts[0], cur)} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+  }
+  if (draft.tool === "arc") {
+    if (pts.length === 1) return <line x1={pts[0].x} y1={pts[0].y} x2={cur.x} y2={cur.y} stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+    const radius = dist(pts[0], pts[1]);
+    const start = angleOf(pts[0], pts[1]);
+    const end = angleOf(pts[0], cur);
+    return <path d={arcPath(pts[0], radius, start, end)} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+  }
+  if (draft.tool === "polygon") {
+    return <polyline points={[...pts, cur].map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+  }
+  if (draft.tool === "cota") {
+    return <line x1={pts[0].x} y1={pts[0].y} x2={cur.x} y2={cur.y} stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
+  }
+  if (draft.tool === "weld") {
+    return <line x1={pts[0].x} y1={pts[0].y} x2={cur.x} y2={cur.y} stroke={color} strokeWidth={sw} strokeDasharray={dash} markerEnd="url(#arrowend)" />;
+  }
+  return null;
+}
+
+/* Agranda/achica una figura manteniendo su centro fijo. factor > 1 agranda, < 1 achica. */
+const SCALE_SUPPORTED_TYPES = new Set(["line", "arrow", "weld", "rect", "profile", "circle", "polygon", "text"]);
+function scaleShapeAround(shape, factor) {
+  switch (shape.type) {
+    case "line":
+    case "arrow":
+    case "weld": {
+      const cx = (shape.p1.x + shape.p2.x) / 2,
+        cy = (shape.p1.y + shape.p2.y) / 2;
+      const scalePt = (p) => ({ x: cx + (p.x - cx) * factor, y: cy + (p.y - cy) * factor });
+      return { p1: scalePt(shape.p1), p2: scalePt(shape.p2) };
+    }
+    case "rect":
+    case "profile": {
+      const x = Math.min(shape.p1.x, shape.p2.x),
+        y = Math.min(shape.p1.y, shape.p2.y);
+      const w = Math.abs(shape.p2.x - shape.p1.x),
+        h = Math.abs(shape.p2.y - shape.p1.y);
+      const cx = x + w / 2,
+        cy = y + h / 2;
+      const nw = Math.max(w * factor, 4),
+        nh = Math.max(h * factor, 4);
+      return { p1: { x: cx - nw / 2, y: cy - nh / 2 }, p2: { x: cx + nw / 2, y: cy + nh / 2 } };
+    }
+    case "circle":
+      return { radius: Math.max(shape.radius * factor, 2) };
+    case "polygon": {
+      const cx = shape.points.reduce((s, p) => s + p.x, 0) / shape.points.length;
+      const cy = shape.points.reduce((s, p) => s + p.y, 0) / shape.points.length;
+      return { points: shape.points.map((p) => ({ x: cx + (p.x - cx) * factor, y: cy + (p.y - cy) * factor })) };
+    }
+    case "text":
+      return { size: Math.max((shape.size || 14) * factor, 4) };
+    default:
+      return {};
+  }
+}
+
+function PropertiesPanel({ shape, unit, onChange, onDelete, onDuplicate }) {
+  const setColor = (hex) => onChange({ color: hex });
+  const canScale = SCALE_SUPPORTED_TYPES.has(shape.type);
+  const isMeasurable = MEASURABLE_TYPES.has(shape.type);
+  return (
+    <div>
+      <h4>{typeLabelEs(shape.type)}</h4>
+      <div className="ws-hint">Arrastra la figura para moverla. Toca y arrastra las esquinas para cambiar su tamaño.</div>
+      {isMeasurable && (
+        <>
+          <div className="ws-hint">Cotas del plano — doble clic sobre cada cota en el lienzo para editarla, o hazlo aquí:</div>
+          {computeAutoCotas(shape, unit, 1).map((desc) => (
+            <label key={desc.side}>
+              {COTA_SIDE_LABELS[desc.side] || desc.side}
+              <div className="ws-cotarow">
+                <input
+                  className="ws-textprop"
+                  value={(shape.cotas && shape.cotas[desc.side]) || ""}
+                  placeholder={desc.label}
+                  onChange={(e) => onChange({ cotas: { ...(shape.cotas || {}), [desc.side]: e.target.value } })}
+                />
+                <select
+                  className="ws-cotaunit"
+                  title="Unidad de esta cota"
+                  value={(shape.cotaUnits && shape.cotaUnits[desc.side]) || ""}
+                  onChange={(e) => onChange({ cotaUnits: { ...(shape.cotaUnits || {}), [desc.side]: e.target.value } })}
+                >
+                  <option value="">plano ({UNIT_LABEL[unit]})</option>
+                  {Object.keys(UNIT_LABEL).map((u) => (
+                    <option key={u} value={u}>
+                      {UNIT_LABEL[u]}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </label>
+          ))}
+          <div className="ws-propactions">
+            {shape.cotas && Object.values(shape.cotas).some((v) => v) && (
+              <button onClick={() => onChange({ cotas: {} })} title="Volver a las cotas automáticas">
+                ↺ Auto
+              </button>
+            )}
+            <button className={shape.showMeasure === true ? "primary" : ""} onClick={() => onChange({ showMeasure: shape.showMeasure !== true })} title="Mostrar/ocultar cotas en el lienzo">
+              {shape.showMeasure === true ? "🚫 Ocultar cotas" : "👁 Mostrar cotas"}
+            </button>
+          </div>
+        </>
+      )}
+      {canScale && (
+        <div className="ws-propactions">
+          <button onClick={() => onChange(scaleShapeAround(shape, 1.15))} title="Agrandar">
+            ⤢ Agrandar
+          </button>
+          <button onClick={() => onChange(scaleShapeAround(shape, 0.87))} title="Achicar">
+            ⤡ Achicar
+          </button>
+        </div>
+      )}
+      {shape.type === "rect" && (
+        <>
+          <NumField label="Ancho" value={Math.abs(shape.p2.x - shape.p1.x)} unit={unit} onCommit={(mm) => onChange({ p2: { ...shape.p2, x: shape.p1.x + Math.sign(shape.p2.x - shape.p1.x || 1) * mm } })} />
+          <NumField label="Alto" value={Math.abs(shape.p2.y - shape.p1.y)} unit={unit} onCommit={(mm) => onChange({ p2: { ...shape.p2, y: shape.p1.y + Math.sign(shape.p2.y - shape.p1.y || 1) * mm } })} />
+          <NumField label="Posición X" value={Math.min(shape.p1.x, shape.p2.x)} unit={unit} onCommit={(mm) => shiftShapeTo(shape, mm, null, onChange)} />
+          <NumField label="Posición Y" value={Math.min(shape.p1.y, shape.p2.y)} unit={unit} onCommit={(mm) => shiftShapeTo(shape, null, mm, onChange)} />
+        </>
+      )}
+      {shape.type === "line" && <NumField label="Longitud" value={dist(shape.p1, shape.p2)} unit={unit} onCommit={(mm) => { const ang = rad(angleOf(shape.p1, shape.p2)); onChange({ p2: { x: shape.p1.x + mm * Math.cos(ang), y: shape.p1.y + mm * Math.sin(ang) } }); }} />}
+      {shape.type === "profile" && (
+        <>
+          <label>
+            Tipo de perfil
+            <select value={shape.profileType} onChange={(e) => onChange({ profileType: e.target.value })}>
+              {PROFILE_TYPES.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {p.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <NumField label="Ancho" value={Math.abs(shape.p2.x - shape.p1.x)} unit={unit} onCommit={(mm) => onChange({ p2: { ...shape.p2, x: shape.p1.x + Math.sign(shape.p2.x - shape.p1.x || 1) * mm } })} />
+          <NumField label="Alto" value={Math.abs(shape.p2.y - shape.p1.y)} unit={unit} onCommit={(mm) => onChange({ p2: { ...shape.p2, y: shape.p1.y + Math.sign(shape.p2.y - shape.p1.y || 1) * mm } })} />
+          {PROFILE_NEEDS_THICKNESS.has(shape.profileType) && <NumField label="Espesor" value={shape.thickness || 5} unit={unit} onCommit={(mm) => onChange({ thickness: mm })} />}
+          <NumField label="Posición X" value={Math.min(shape.p1.x, shape.p2.x)} unit={unit} onCommit={(mm) => shiftShapeTo(shape, mm, null, onChange)} />
+          <NumField label="Posición Y" value={Math.min(shape.p1.y, shape.p2.y)} unit={unit} onCommit={(mm) => shiftShapeTo(shape, null, mm, onChange)} />
+          <label>Orientación</label>
+          <div className="ws-propactions">
+            <button onClick={() => onChange({ rotation: ((shape.rotation || 0) + 90) % 360 })} title="Girar 90°">
+              ⟳ Rotar 90°
+            </button>
+          </div>
+          <div className="ws-propactions">
+            <button className={shape.mirror ? "primary" : ""} onClick={() => onChange({ mirror: !shape.mirror })} title="Espejo horizontal">
+              ↔ Voltear horizontal
+            </button>
+            <button className={shape.mirrorV ? "primary" : ""} onClick={() => onChange({ mirrorV: !shape.mirrorV })} title="Espejo vertical">
+              ↕ Voltear vertical
+            </button>
+          </div>
+        </>
+      )}
+      {shape.type === "circle" && <NumField label="Radio" value={shape.radius} unit={unit} onCommit={(mm) => onChange({ radius: mm })} />}
+      {shape.type === "text" && (
+        <>
+          <label>
+            Contenido
+            <input className="ws-textprop" value={shape.text} onChange={(e) => onChange({ text: e.target.value })} />
+          </label>
+          <NumField label="Tamaño" value={shape.size} unit="mm" onCommit={(mm) => onChange({ size: mm })} />
+          <NumField label="Rotación (°)" value={shape.rotation || 0} unit="" isDeg onCommit={(v) => onChange({ rotation: v })} />
+        </>
+      )}
+      {shape.type === "dimension" && (
+        <>
+          <div className="ws-hint">Tipo: {shape.kind}</div>
+          <div className="ws-hint">Valor: {shape.overrideText || dimLabel(shape, unit)}</div>
+          {shape.kind !== "angulo" && (
+            <label>
+              Unidad de esta cota
+              <select value={shape.unit || ""} onChange={(e) => onChange({ unit: e.target.value })}>
+                <option value="">Usar unidad del plano ({UNIT_LABEL[unit]})</option>
+                {Object.keys(UNIT_LABEL).map((u) => (
+                  <option key={u} value={u}>
+                    {UNIT_LABEL[u]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label>
+            Sobrescribir valor
+            <input className="ws-textprop" value={shape.overrideText || ""} placeholder={dimLabel(shape, unit)} onChange={(e) => onChange({ overrideText: e.target.value })} />
+          </label>
+        </>
+      )}
+      {shape.type === "weld" && (
+        <>
+          <label>
+            Tipo de soldadura
+            <select value={shape.weldType} onChange={(e) => onChange({ weldType: e.target.value })}>
+              {WELD_TYPES.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Lado del símbolo
+            <select value={shape.side} onChange={(e) => onChange({ side: e.target.value })}>
+              {WELD_SIDES.map((w) => (
+                <option key={w.id} value={w.id}>
+                  {w.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Tamaño / cateto
+            <input className="ws-textprop" value={shape.size || ""} placeholder="p. ej. 5" onChange={(e) => onChange({ size: e.target.value })} />
+          </label>
+          <NumField label="Longitud de línea" value={shape.length || 40} unit={unit} onCommit={(mm) => onChange({ length: mm })} />
+          <label>
+            Nota / proceso (cola)
+            <input className="ws-textprop" value={shape.tail || ""} placeholder="p. ej. SMAW" onChange={(e) => onChange({ tail: e.target.value })} />
+          </label>
+          <label className="ws-check">
+            <input type="checkbox" checked={!!shape.allAround} onChange={(e) => onChange({ allAround: e.target.checked })} />
+            Todo alrededor
+          </label>
+          <label className="ws-check">
+            <input type="checkbox" checked={!!shape.campo} onChange={(e) => onChange({ campo: e.target.checked })} />
+            Soldadura de campo
+          </label>
+        </>
+      )}
+      <label>
+        Color
+        <div className="ws-colors">
+          {PALETTE.map((c) => (
+            <button key={c.id} className={`ws-swatch ${shape.color === c.hex ? "on" : ""}`} style={{ background: c.hex }} onClick={() => setColor(c.hex)} />
+          ))}
+        </div>
+      </label>
+      <div className="ws-propactions">
+        <button onClick={onDuplicate}>Duplicar (Ctrl+D)</button>
+        <button className="danger" onClick={onDelete}>
+          Eliminar
+        </button>
+      </div>
+    </div>
+  );
+}
+function shiftShapeTo(shape, newX, newY, onChange) {
+  const curMinX = Math.min(shape.p1.x, shape.p2.x);
+  const curMinY = Math.min(shape.p1.y, shape.p2.y);
+  const dx = newX !== null ? newX - curMinX : 0;
+  const dy = newY !== null ? newY - curMinY : 0;
+  onChange({ p1: { x: shape.p1.x + dx, y: shape.p1.y + dy }, p2: { x: shape.p2.x + dx, y: shape.p2.y + dy } });
+}
+function typeLabelEs(t) {
+  return { line: "Línea", rect: "Rectángulo", circle: "Círculo", arc: "Arco", polygon: "Polígono", profile: "Perfil", text: "Texto", arrow: "Flecha", dimension: "Cota", weld: "Símbolo de soldadura" }[t] || t;
+}
+
+function NumField({ label, value, unit, onCommit, isDeg }) {
+  const [local, setLocal] = useState(isDeg ? round(value, 1) : toDisplay(value, unit));
+  useEffect(() => setLocal(isDeg ? round(value, 1) : toDisplay(value, unit)), [value, unit]); // eslint-disable-line
+  return (
+    <label>
+      {label} {isDeg ? "" : `(${UNIT_LABEL[unit]})`}
+      <input
+        type="number"
+        className="ws-numinput"
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        onBlur={() => {
+          const v = parseFloat(local);
+          if (!isNaN(v)) onCommit(isDeg ? v : v * UNIT_FACTORS[unit]);
+        }}
+        onKeyDown={(e) => e.key === "Enter" && e.target.blur()}
+      />
+    </label>
+  );
+}
+
+function Modal({ title, children, onClose }) {
+  return (
+    <div className="ws-modalbg" onClick={onClose}>
+      <div className="ws-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="ws-modalhead">
+          <h3>{title}</h3>
+          <button onClick={onClose}>✕</button>
+        </div>
+        <div className="ws-modalbody">{children}</div>
+      </div>
+    </div>
+  );
+}
+function SaveModal({ defaultName, onCancel, onConfirm }) {
+  const [name, setName] = useState(defaultName || "Boceto sin título");
+  return (
+    <Modal title="Guardar boceto" onClose={onCancel}>
+      <input autoFocus className="ws-textprop" value={name} onChange={(e) => setName(e.target.value)} onKeyDown={(e) => e.key === "Enter" && onConfirm(name)} />
+      <div className="ws-propactions">
+        <button onClick={onCancel}>Cancelar</button>
+        <button className="primary" onClick={() => onConfirm(name)}>
+          Guardar
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/* =========================================================================
+   Styles
+   ========================================================================= */
+const CSS = `
+:root{
+  --bg:#F6F4EF; --panel:#FFFFFF; --border:#DDD7CB; --ink:#2B2E33; --ink-soft:#6B6357;
+  --accent:#D9622B; --accent-soft:#F0C9AE; --sheet:#FFFFFF; --grid:#D8CFC0; --canvasbg:#EFEBE1;
+}
+.dark{
+  --bg:#1B1D21; --panel:#232629; --border:#34383D; --ink:#E9E6DF; --ink-soft:#9A9488;
+  --accent:#E8834A; --accent-soft:#5A3A28; --sheet:#26282C; --grid:#33363A; --canvasbg:#1F2124;
+}
+.ws-root{ font-family:'IBM Plex Sans',system-ui,sans-serif; color:var(--ink); background:var(--bg); height:100vh; height:100dvh; display:flex; flex-direction:column; overflow:hidden; }
+.ws-root *{ box-sizing:border-box; }
+.ws-root button{ font-family:inherit; cursor:pointer; border:1px solid var(--border); background:var(--panel); color:var(--ink); border-radius:6px; padding:6px 10px; font-size:12.5px; touch-action:manipulation; }
+.ws-root button:hover{ border-color:var(--accent); }
+.ws-root button:disabled{ opacity:.4; cursor:default; }
+.ws-root button.primary{ background:var(--accent); color:#fff; border-color:var(--accent); }
+.ws-root select, .ws-root input{ font-family:inherit; border:1px solid var(--border); background:var(--panel); color:var(--ink); border-radius:6px; padding:5px 7px; font-size:12.5px; }
+.ws-mobiletoggle{ display:none; flex:0 0 auto; font-size:16px; padding:6px 10px; }
+.ws-drawerclose{ display:none; }
+.ws-overlay{ display:none; position:fixed; inset:0; background:rgba(20,18,14,.35); z-index:35; }
+
+.ws-topbar{ display:flex; align-items:center; gap:14px; padding:8px 14px; border-bottom:1px solid var(--border); background:var(--panel); }
+.ws-brand{ display:flex; align-items:center; gap:7px; font-weight:600; letter-spacing:.2px; }
+.ws-brandtext{ display:flex; flex-direction:column; line-height:1.15; }
+.ws-signature{ font-weight:500; font-size:10.5px; letter-spacing:.2px; color:var(--accent); text-transform:none; }
+.ws-projname{ flex:0 0 220px; font-weight:500; }
+.ws-topactions{ margin-left:auto; display:flex; align-items:center; gap:6px; }
+.ws-exportgroup{ display:flex; gap:6px; margin-left:6px; padding-left:10px; border-left:1px solid var(--border); }
+.ws-theme{ margin-left:6px; }
+
+.ws-body{ flex:1; display:flex; min-height:0; }
+
+.ws-toolbar{ width:118px; flex:0 0 118px; border-right:1px solid var(--border); background:var(--panel); padding:10px 8px; display:flex; flex-direction:column; gap:5px; overflow-y:auto; }
+.ws-tool{ display:flex; flex-direction:column; align-items:center; gap:3px; padding:8px 4px; }
+.ws-tool span{ font-size:10.5px; }
+.ws-tool.on{ background:var(--accent-soft); border-color:var(--accent); color:var(--accent); }
+.ws-sep{ height:1px; background:var(--border); margin:4px 2px; }
+.ws-dimkind{ width:100%; }
+.ws-colors{ display:flex; gap:6px; flex-wrap:wrap; }
+.ws-swatch{ width:20px; height:20px; border-radius:5px; padding:0; border:2px solid transparent; }
+.ws-swatch.on{ border-color:var(--ink); }
+
+.ws-canvaswrap{ flex:1; position:relative; background:var(--canvasbg); overflow:hidden; }
+.ws-canvas{ width:100%; height:100%; display:block; touch-action:none; }
+.ws-canvas.panning{ cursor:grab; }
+.ws-sheet{ fill:var(--sheet); stroke:var(--border); stroke-width:0.6; filter:drop-shadow(0 1px 6px rgba(0,0,0,.12)); }
+.ws-grid{ stroke:var(--grid); }
+.ws-shape{ }
+.ws-shape.selected line, .ws-shape.selected rect, .ws-shape.selected circle, .ws-shape.selected path, .ws-shape.selected polygon{ filter:drop-shadow(0 0 0 var(--accent)); }
+.ws-handle{ fill:#fff; stroke:var(--accent); stroke-width:1.4; cursor:pointer; }
+.ws-measurelabel{ opacity:0.82; paint-order:stroke; stroke:var(--panel); stroke-width:3px; stroke-linejoin:round; }
+.ws-measurelabel-plain{ opacity:0.68; }
+.ws-shape:hover .ws-measurelabel{ opacity:1; }
+.ws-inlineinput{ width:100%; height:26px; border:1.5px solid var(--accent); border-radius:5px; padding:2px 6px; font-family:'IBM Plex Sans',sans-serif; font-size:13px; background:var(--panel); color:var(--ink); }
+
+.ws-viewctrls{ position:absolute; right:14px; bottom:14px; display:flex; gap:6px; }
+
+.ws-props{ width:250px; flex:0 0 250px; border-left:1px solid var(--border); background:var(--panel); padding:14px; overflow-y:auto; }
+.ws-props h4{ margin:0 0 10px 0; font-size:13px; text-transform:none; color:var(--ink); }
+.ws-props label{ display:flex; flex-direction:column; gap:4px; font-size:11.5px; color:var(--ink-soft); margin-bottom:10px; }
+.ws-props label select, .ws-props label input{ color:var(--ink); }
+.ws-check{ flex-direction:row !important; align-items:center; gap:7px !important; }
+.ws-check input{ width:auto; }
+.ws-numinput, .ws-textprop{ width:100%; }
+.ws-cotarow{ display:flex; gap:5px; }
+.ws-cotarow .ws-textprop{ flex:1; min-width:0; }
+.ws-cotaunit{ flex:0 0 auto; width:auto; max-width:92px; }
+.ws-propactions{ display:flex; gap:8px; margin-top:6px; }
+.ws-propactions .danger{ border-color:#C6392C; color:#C6392C; }
+.ws-hint{ font-size:11px; color:var(--ink-soft); line-height:1.5; margin-top:8px; }
+.ws-muted{ color:var(--ink-soft); font-size:12.5px; }
+
+.ws-statusbar{ display:flex; gap:18px; padding:5px 14px; border-top:1px solid var(--border); background:var(--panel); font-family:'IBM Plex Mono',monospace; font-size:11px; color:var(--ink-soft); }
+.ws-savestate{ margin-left:auto; }
+
+.ws-modalbg{ position:fixed; inset:0; background:rgba(20,18,14,.4); display:flex; align-items:center; justify-content:center; z-index:50; }
+.ws-modal{ width:360px; background:var(--panel); border-radius:10px; border:1px solid var(--border); overflow:hidden; }
+.ws-modalhead{ display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border); }
+.ws-modalhead h3{ margin:0; font-size:14px; }
+.ws-modalbody{ padding:14px; display:flex; flex-direction:column; gap:10px; }
+.ws-projlist{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; max-height:280px; overflow-y:auto; }
+.ws-projlist li{ display:flex; align-items:center; gap:6px; }
+.ws-projitem{ flex:1; display:flex; flex-direction:column; align-items:flex-start; gap:2px; }
+.ws-projitem small{ color:var(--ink-soft); }
+.ws-projdel{ padding:6px 8px; }
+
+@media (max-width: 760px){
+  .ws-overlay{ display:block; }
+  .ws-topbar{ flex-wrap:wrap; gap:8px; padding:8px 10px; }
+  .ws-mobiletoggle{ display:flex; align-items:center; justify-content:center; width:38px; height:38px; }
+  .ws-brand span{ display:none; }
+  .ws-projname{ flex:1 1 auto; min-width:0; order:1; }
+  .ws-topactions{ order:2; flex-basis:100%; margin-left:0; overflow-x:auto; -webkit-overflow-scrolling:touch; padding-bottom:2px; }
+  .ws-topactions button{ flex:0 0 auto; white-space:nowrap; }
+  .ws-exportgroup{ margin-left:0; }
+
+  .ws-root select, .ws-root input{ font-size:16px; } /* prevents iOS auto-zoom on focus */
+  .ws-root button{ font-size:13.5px; padding:9px 12px; min-height:40px; }
+
+  .ws-toolbar{
+    position:fixed; z-index:40; top:0; bottom:0; left:0;
+    width:76vw; max-width:280px; flex:0 0 auto;
+    transform:translateX(-105%); transition:transform .2s ease;
+    box-shadow:2px 0 14px rgba(0,0,0,.25);
+    padding-top:56px;
+  }
+  .ws-toolbar.open{ transform:translateX(0); }
+  .ws-tool{ flex-direction:row; justify-content:flex-start; gap:10px; padding:11px 10px; min-height:44px; }
+  .ws-tool span{ font-size:13px; }
+  .ws-swatch{ width:30px; height:30px; }
+
+  .ws-props{
+    position:fixed; z-index:40; top:0; bottom:0; right:0;
+    width:80vw; max-width:320px; flex:0 0 auto;
+    transform:translateX(105%); transition:transform .2s ease;
+    box-shadow:-2px 0 14px rgba(0,0,0,.25);
+    padding-top:56px;
+  }
+  .ws-props.open{ transform:translateX(0); }
+
+  .ws-drawerclose{
+    display:flex; position:absolute; top:8px; right:8px; left:8px;
+    justify-content:flex-end; padding:8px 10px; min-height:36px;
+  }
+
+  .ws-viewctrls{ right:10px; bottom:calc(10px + env(safe-area-inset-bottom)); }
+  .ws-viewctrls button{ min-width:44px; min-height:44px; font-size:15px; }
+
+  .ws-statusbar{ font-size:10px; gap:10px; padding:5px 10px; overflow-x:auto; white-space:nowrap; }
+  .ws-statusbar span:nth-child(4){ display:none; } /* grid size, low priority on phone */
+  .ws-statusbar span:nth-child(5){ display:none; } /* snap state, low priority on phone */
+
+  .ws-modal{ width:92vw; }
+}
+`;
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<WeldSketch />);
+</script>
+</body>
+</html>
