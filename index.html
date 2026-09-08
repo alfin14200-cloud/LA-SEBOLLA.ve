@@ -500,7 +500,11 @@ function WeldSketch() {
   const selected = d.shapes.find((s) => s.id === selectedId) || null;
 
   useEffect(() => {
-    if (selectedId && tool === "select") setMobilePropsOpen(true);
+    /* Antes esto abría automáticamente el panel de propiedades (barra lateral)
+       apenas se seleccionaba una figura. Se quitó a pedido: ahora seleccionar
+       solo selecciona (para poder mover/agrandar/encoger), y el panel se abre
+       manualmente con el botón "Propiedades". Al deseleccionar sí lo cerramos,
+       por si había quedado abierto. */
     if (!selectedId) setMobilePropsOpen(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
@@ -870,6 +874,20 @@ function WeldSketch() {
     setMeasureEdit({ id: shape.id, side: desc.side, value: (shape.cotas && shape.cotas[desc.side]) || "", placeholder: autoDesc ? autoDesc.label : "", pos });
   }
 
+  /* Captura el puntero en el elemento donde empezó el arrastre (botón de
+     mover, resto de la figura, o handle de esquina) para que el arrastre no
+     se corte si el dedo se desliza fuera de esa figura o incluso fuera del
+     lienzo: todos los pointermove/pointerup siguientes se siguen entregando
+     a este mismo elemento hasta soltar. Antes esto no pasaba y arrastres
+     rápidos o cerca del borde podían "perder" el dedo a mitad de camino. */
+  function capturePointer(e) {
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    } catch (err) {
+      /* algunos navegadores viejos no soportan pointer capture en SVG: no pasa nada, sigue funcionando sin ella */
+    }
+  }
+
   /* ---------------- dragging shapes / handles (select tool) ---------------- */
   function startDragMove(e, shape) {
     e.stopPropagation();
@@ -885,6 +903,7 @@ function WeldSketch() {
       openShapeEditor(shape);
       return;
     }
+    capturePointer(e);
     setSelectedId(shape.id);
     const raw = getPointerWorld(e);
     setDragState({ mode: "move", id: shape.id, start: raw, origShape: shape });
@@ -892,6 +911,7 @@ function WeldSketch() {
   function startDragHandle(e, shape, handleKey) {
     e.stopPropagation();
     if (tool !== "select") return;
+    capturePointer(e);
     setSelectedId(shape.id);
     setDragState({ mode: "handle", id: shape.id, handleKey, origShape: shape });
   }
@@ -1373,6 +1393,7 @@ function WeldSketch() {
                   shape={s}
                   unit={d.unit}
                   selected={s.id === selectedId}
+                  dragging={!!(dragState && dragState.mode === "move" && dragState.id === s.id)}
                   tool={tool}
                   scale={viewport.scale}
                   onPointerDownShape={(e) => startDragMove(e, s)}
@@ -1729,6 +1750,17 @@ function shapeBounds(s) {
   };
 }
 
+/* Punto de referencia (esquina superior-izquierda aprox.) usado para anclar
+   el botón táctil de selección de cada figura. Cubre también texto y cota,
+   que no tienen puntos de snap "normales". */
+function shapeAnchorPoint(s) {
+  if (s.type === "text") return { x: s.pos.x, y: s.pos.y };
+  if (s.type === "dimension") return { x: Math.min(s.p1.x, s.p2.x), y: Math.min(s.p1.y, s.p2.y) };
+  const b = shapeBounds(s);
+  if (b) return { x: b.minX, y: b.minY };
+  return null;
+}
+
 /* Decide de qué lado (arriba/abajo o izquierda/derecha) debe quedar una
    cota horizontal o vertical para no cruzar por encima de las figuras
    cercanas al segmento medido. Devuelve -1 o 1 (signo del offset). */
@@ -1963,7 +1995,7 @@ function AutoCotaShape({ desc, color, scale, onDoubleClick, onPointerDown }) {
 }
 
 /* Renders one shape, either interactive (with selection handles) or static (export) */
-function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, onPointerDownHandle, onDoubleClick, onCotaDoubleClick, onCotaPointerDown }) {
+function ShapeView({ shape: s, unit, selected, dragging, tool, scale, onPointerDownShape, onPointerDownHandle, onDoubleClick, onCotaDoubleClick, onCotaPointerDown }) {
   const stroke = s.color;
   const sw = 1.6 / scale;
   const interactiveProps = { onPointerDown: onPointerDownShape, onDoubleClick, style: { cursor: tool === "borrar" ? "not-allowed" : tool === "select" ? "move" : "crosshair" } };
@@ -2027,6 +2059,21 @@ function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, 
 
   const handles = selected && tool === "select" ? getHandles(s).map((h, i) => <Handle key={i} p={h.p} kind={h.kind} onPointerDown={(e) => onPointerDownHandle(e, h.key)} />) : null;
 
+  /* Botón discreto de selección: un blanco táctil más grande que el trazo de
+     la figura, para que sea fácil tocarla en pantallas táctiles sin depender
+     de acertarle a una línea fina. Tocarlo/clicarlo selecciona la figura (y,
+     si se arrastra, también la mueve) sin abrir ningún panel lateral. Solo se
+     muestra con la herramienta "Seleccionar" para no estorbar al dibujar. */
+  let anchorBtn = null;
+  if (tool === "select") {
+    const ap = shapeAnchorPoint(s);
+    if (ap) {
+      const off = 15 / scale;
+      const pos = { x: ap.x - off, y: ap.y - off };
+      anchorBtn = <SelectAnchor p={pos} selected={selected} dragging={dragging} scale={scale} onPointerDown={onPointerDownShape} />;
+    }
+  }
+
   let cotaEls = null;
   if (MEASURABLE_TYPES.has(s.type) && s.showMeasure === true) {
     const ext = 14 / scale;
@@ -2050,6 +2097,49 @@ function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, 
       {body}
       {cotaEls}
       {handles}
+      {anchorBtn}
+    </g>
+  );
+}
+
+/* Botón flotante de selección/arrastre por figura: círculo con un icono de
+   "mover" (cruz de 4 flechas), discreto (semitransparente) en reposo y
+   resaltado en el color de acento cuando la figura está seleccionada. Su
+   tamaño se compensa con 1/scale para que se vea igual en pantalla sin
+   importar el zoom, así siempre es un blanco fácil de tocar. */
+/* Botón flotante de selección/arrastre por figura: círculo con un icono de
+   "mover" (cruz de 4 flechas), discreto (semitransparente) en reposo,
+   resaltado en el color de acento cuando la figura está seleccionada, y con
+   un halo cuando se está arrastrando activamente (feedback táctil claro).
+   Se compensa con 1/scale para verse igual en pantalla sin importar el zoom.
+   Incluye un círculo invisible más grande alrededor del ícono para ampliar
+   el blanco de toque real sin agrandar lo que se ve. */
+function SelectAnchor({ p, selected, dragging, scale, onPointerDown }) {
+  const r = 10 / scale; // radio visible
+  const hit = 17 / scale; // radio del área táctil real (invisible)
+  const a = r * 0.62;
+  const sw = 1.4 / scale;
+  return (
+    <g
+      className={`ws-anchorbtn${selected ? " selected" : ""}${dragging ? " dragging" : ""}`}
+      transform={`translate(${p.x} ${p.y})`}
+      onPointerDown={onPointerDown}
+    >
+      {/* halo suave al arrastrar, para dar confirmación visual del agarre */}
+      {dragging && <circle r={r * 1.9} className="ws-anchorbtn-halo" />}
+      {/* área de toque invisible, más generosa que el círculo visible */}
+      <circle r={hit} className="ws-anchorbtn-hit" />
+      <circle r={r} className="ws-anchorbtn-bg" />
+      <circle r={r} className="ws-anchorbtn-ring" fill="none" />
+      {/* icono de 4 flechas (mover), dibujado con líneas + puntas en V, más limpio que trazos sueltos */}
+      <g strokeLinejoin="round">
+        {[0, 90, 180, 270].map((rot) => (
+          <g key={rot} transform={`rotate(${rot})`}>
+            <line x1={0} y1={0} x2={0} y2={-a} stroke="#fff" strokeWidth={sw} strokeLinecap="round" />
+            <path d={`M ${-a * 0.42} ${-a * 0.62} L 0 ${-a} L ${a * 0.42} ${-a * 0.62}`} fill="none" stroke="#fff" strokeWidth={sw} strokeLinecap="round" />
+          </g>
+        ))}
+      </g>
     </g>
   );
 }
@@ -2762,6 +2852,15 @@ const CSS = `
 .ws-shape{ }
 .ws-shape.selected line, .ws-shape.selected rect, .ws-shape.selected circle, .ws-shape.selected path, .ws-shape.selected polygon{ filter:drop-shadow(0 0 0 var(--accent)); }
 .ws-handle{ fill:#fff; stroke:var(--accent); stroke-width:1.4; cursor:pointer; }
+.ws-anchorbtn{ cursor:grab; touch-action:none; }
+.ws-anchorbtn-hit{ fill:transparent; }
+.ws-anchorbtn-bg{ fill:var(--ink); opacity:.6; filter:drop-shadow(0 1px 2px rgba(0,0,0,.35)); transition:opacity .12s ease, fill .12s ease; }
+.ws-anchorbtn-ring{ stroke:#fff; stroke-width:1; opacity:.85; }
+.ws-anchorbtn:hover .ws-anchorbtn-bg{ opacity:.85; }
+.ws-anchorbtn.selected .ws-anchorbtn-bg{ fill:var(--accent); opacity:1; }
+.ws-anchorbtn.dragging{ cursor:grabbing; }
+.ws-anchorbtn.dragging .ws-anchorbtn-bg{ fill:var(--accent); opacity:1; }
+.ws-anchorbtn-halo{ fill:var(--accent); opacity:.18; }
 .ws-measurelabel{ opacity:0.82; paint-order:stroke; stroke:var(--panel); stroke-width:3px; stroke-linejoin:round; }
 .ws-measurelabel-plain{ opacity:0.68; }
 .ws-shape:hover .ws-measurelabel{ opacity:1; }
