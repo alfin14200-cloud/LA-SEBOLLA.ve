@@ -61,13 +61,18 @@ window.storage = {
    ========================================================================= */
 
 const UNIT_FACTORS = { mm: 1, cm: 10, m: 1000, in: 25.4 };
+const ERASE_CELL_MM = 10; // tamaño fijo de la celda que borra la herramienta "Borrar", en mm
 const UNIT_LABEL = { mm: "mm", cm: "cm", m: "m", in: '"' };
 const SHEETS = { A4: { w: 210, h: 297 }, A3: { w: 297, h: 420 }, A2: { w: 420, h: 594 } };
 const PALETTE = [
   { id: "graphite", hex: "#2B2E33", label: "Grafito" },
+  { id: "black", hex: "#000000", label: "Negro" },
   { id: "gray", hex: "#6B7280", label: "Gris" },
   { id: "blue", hex: "#2F6FB0", label: "Azul" },
   { id: "red", hex: "#C6392C", label: "Rojo" },
+  { id: "green", hex: "#2E8B57", label: "Verde" },
+  { id: "orange", hex: "#E08A2B", label: "Naranja" },
+  { id: "purple", hex: "#7B4FA0", label: "Morado" },
 ];
 /* Catálogo de perfiles esenciales de soldadura / herrería */
 const PROFILE_TYPES = [
@@ -196,6 +201,7 @@ function shapeSnapPoints(s) {
     case "arc":
       return [s.center, arcPoint(s.center, s.radius, s.start), arcPoint(s.center, s.radius, s.end)];
     case "polygon":
+    case "freehand":
       return s.points;
     default:
       return [];
@@ -462,6 +468,8 @@ function WeldSketch() {
   const panRef = useRef(null);
   const autosaveTimer = useRef(null);
   const activePointers = useRef(new Map());
+  const eraseDragRef = useRef(false); // true mientras se arrastra con la herramienta "Borrar"
+  const freehandDragRef = useRef(false); // true mientras se arrastra con la herramienta "Lápiz" (trazo libre)
   const pinchState = useRef(null);
   const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
@@ -567,6 +575,73 @@ function WeldSketch() {
     setDoc((prev) => ({ ...prev, shapes: prev.shapes.filter((s) => s.id !== id) }));
     if (selectedId === id) setSelectedId(null);
   };
+  /* Herramienta Borrar: en vez de exigir tocar justo la línea fina de una
+     figura, borra por cuadrícula fija de 10x10 mm (independiente del tamaño
+     de grilla configurado para dibujar/ajustar): toma la celda de 10mm donde
+     está el puntero y actúa sobre esa celda. Se llama tanto al tocar como en
+     cada movimiento mientras se arrastra con esta herramienta, así "pintás"
+     el borrado igual que una goma de borrar real, de 10 en 10 mm.
+     Para líneas, flechas y soldaduras (trazos rectos de un solo tramo) NO se
+     borra la figura completa: se recorta solo el pedacito de 10mm que cae
+     dentro de la celda y se conserva el resto del trazo (que puede quedar en
+     0, 1 o 2 pedazos). Para trazos de lápiz libre (varios tramos seguidos) se
+     aplica el mismo recorte tramo a tramo, así que un trazo largo puede
+     quedar partido en varios pedazos si se borra por el medio. Para las
+     demás figuras (rectángulo, círculo, arco, polígono, perfil, texto, cota)
+     se sigue borrando la figura entera en cuanto su caja delimitadora toca
+     la celda, como antes. */
+  const LINEAR_ERASE_TYPES = new Set(["line", "arrow", "weld"]);
+  const eraseAtPoint = (p) => {
+    const gs = ERASE_CELL_MM;
+    const gx = Math.floor(p.x / gs) * gs;
+    const gy = Math.floor(p.y / gs) * gs;
+    const cell = { minX: gx, maxX: gx + gs, minY: gy, maxY: gy + gs };
+
+    let touched = false;
+    let removedSelected = false;
+    const nextShapes = [];
+
+    for (const s of d.shapes) {
+      if (LINEAR_ERASE_TYPES.has(s.type)) {
+        const pieces = clipSegmentAgainstCell(s.p1, s.p2, cell);
+        if (pieces === "none") {
+          nextShapes.push(s);
+          continue;
+        }
+        touched = true;
+        if (s.id === selectedId) removedSelected = true;
+        for (const piece of pieces) {
+          nextShapes.push({ ...s, id: uid(), p1: piece.p1, p2: piece.p2 });
+        }
+        continue;
+      }
+      if (s.type === "freehand") {
+        const runs = clipPolylineAgainstCell(s.points, cell);
+        if (runs === "none") {
+          nextShapes.push(s);
+          continue;
+        }
+        touched = true;
+        if (s.id === selectedId) removedSelected = true;
+        for (const run of runs) {
+          nextShapes.push({ ...s, id: uid(), points: run });
+        }
+        continue;
+      }
+      const b = eraseBounds(s);
+      const overlaps = b && cell.minX <= b.maxX && cell.maxX >= b.minX && cell.minY <= b.maxY && cell.maxY >= b.minY;
+      if (overlaps) {
+        touched = true;
+        if (s.id === selectedId) removedSelected = true;
+        continue;
+      }
+      nextShapes.push(s);
+    }
+
+    if (!touched) return;
+    setDoc((prev) => ({ ...prev, shapes: nextShapes }));
+    if (removedSelected) setSelectedId(null);
+  };
   const duplicateSelected = () => {
     if (!selected) return;
     const off = { x: 10, y: 10 };
@@ -589,6 +664,7 @@ function WeldSketch() {
       case "arc":
         return { ...s, center: { x: s.center.x + off.x, y: s.center.y + off.y } };
       case "polygon":
+      case "freehand":
         return { ...s, points: s.points.map((p) => ({ x: p.x + off.x, y: p.y + off.y })) };
       case "text":
         return { ...s, pos: { x: s.pos.x + off.x, y: s.pos.y + off.y } };
@@ -612,6 +688,7 @@ function WeldSketch() {
       // entering / continuing a two-finger gesture: cancel any single-finger action in progress
       panRef.current = null;
       touchDrawRef.current = null;
+      freehandDragRef.current = false;
       setDraft(null);
       setDragState(null);
       const pts = Array.from(activePointers.current.values()).slice(0, 2);
@@ -633,7 +710,20 @@ function WeldSketch() {
     const p = snapWorldPoint(raw, draft && draft.excludeId);
 
     if (tool === "select") return; // handled by shape/handle onPointerDown
-    if (tool === "borrar") return; // handled by shape onClick
+    if (tool === "borrar") {
+      eraseDragRef.current = true;
+      eraseAtPoint(raw);
+      return;
+    }
+    if (tool === "lapiz") {
+      /* Trazo libre: se arranca a arrastrar (mouse o dedo) y cada
+         pointermove va agregando puntos al trazo en curso, sin ajustarlo a
+         la grilla ni a otras figuras (para que el trazo salga libre, como
+         con un lápiz real). Se termina al soltar. */
+      freehandDragRef.current = true;
+      setDraft({ tool: "lapiz", points: [raw], cursor: raw });
+      return;
+    }
 
     /* --- En táctil, las herramientas de dos puntos se dibujan con un solo
        arrastre continuo (dedo abajo = inicio, dedo arriba = fin), igual que
@@ -790,6 +880,26 @@ function WeldSketch() {
       return;
     }
     const raw = getPointerWorld(e);
+
+    if (tool === "borrar" && eraseDragRef.current) {
+      setCursorWorld(raw);
+      eraseAtPoint(raw);
+      return;
+    }
+
+    if (tool === "lapiz" && freehandDragRef.current) {
+      setCursorWorld(raw);
+      setDraft((dft) => {
+        if (!dft || dft.tool !== "lapiz") return dft;
+        const pts = dft.points;
+        const last = pts[pts.length - 1];
+        const minDist = 1.2 / viewport.scale; // no guardar puntos demasiado seguidos
+        if (last && dist(last, raw) < minDist) return { ...dft, cursor: raw };
+        return { ...dft, points: [...pts, raw], cursor: raw };
+      });
+      return;
+    }
+
     const p = snapWorldPoint(raw, dragState && dragState.id);
     setCursorWorld(p);
 
@@ -801,6 +911,14 @@ function WeldSketch() {
   };
 
   const handleCanvasPointerUp = (e) => {
+    eraseDragRef.current = false;
+    if (freehandDragRef.current) {
+      freehandDragRef.current = false;
+      if (draft && draft.tool === "lapiz" && draft.points.length >= 2) {
+        pushShape({ id: uid(), type: "freehand", points: draft.points, color: activeColor });
+      }
+      setDraft(null);
+    }
     if (e && activePointers.current.has(e.pointerId)) activePointers.current.delete(e.pointerId);
     if (activePointers.current.size < 2) pinchState.current = null;
     if (activePointers.current.size === 0) {
@@ -890,12 +1008,14 @@ function WeldSketch() {
 
   /* ---------------- dragging shapes / handles (select tool) ---------------- */
   function startDragMove(e, shape) {
-    e.stopPropagation();
-    if (tool === "borrar") {
-      deleteShape(shape.id);
-      return;
-    }
+    /* Con cualquier otra herramienta (dibujar, borrar, etc.) NO se detiene la
+       propagación: así el toque pasa al lienzo y se puede trazar/borrar sobre
+       o encima de una figura existente (antes esto quedaba "atrapado" por la
+       figura y no pasaba nada, por ejemplo al intentar dibujar una línea que
+       arranca justo en el borde de un rectángulo). Solo la herramienta
+       "Seleccionar" usa este evento. */
     if (tool !== "select") return;
+    e.stopPropagation();
     /* Doble toque táctil sobre la figura = abrir su editor (texto/cota),
        igual que el doble clic en escritorio, sin iniciar un arrastre. */
     if (checkDoubleTap(e, "shape:" + shape.id)) {
@@ -1054,6 +1174,7 @@ function WeldSketch() {
         return;
       }
       if (e.key === "Escape") {
+        freehandDragRef.current = false;
         setDraft(null);
         setTool("select");
       }
@@ -1061,7 +1182,7 @@ function WeldSketch() {
         e.preventDefault();
         deleteShape(selectedId);
       }
-      const map = { l: "line", r: "rect", c: "circle", d: "cota", t: "texto", a: "arc", p: "polygon", f: "arrow", v: "select", h: "mano", g: "perfil", s: "weld" };
+      const map = { l: "line", r: "rect", c: "circle", d: "cota", t: "texto", a: "arc", p: "polygon", f: "arrow", v: "select", h: "mano", g: "perfil", s: "weld", b: "lapiz" };
       if (map[e.key.toLowerCase()] && !e.repeat) setTool(map[e.key.toLowerCase()]);
     };
     const onKeyUp = (e) => {
@@ -1316,6 +1437,7 @@ function WeldSketch() {
           <ToolBtn active={tool === "select"} label="Seleccionar" hint="V" onClick={() => setTool("select")} icon="cursor" />
           <ToolBtn active={tool === "mano"} label="Mano" hint="H" onClick={() => setTool("mano")} icon="hand" />
           <ToolBtn active={tool === "line"} label="Línea" hint="L" onClick={() => setTool("line")} icon="line" />
+          <ToolBtn active={tool === "lapiz"} label="Lápiz libre" hint="B" onClick={() => setTool("lapiz")} icon="pencil" />
           <ToolBtn active={tool === "rect"} label="Rectángulo" hint="R" onClick={() => setTool("rect")} icon="rect" />
           <ToolBtn active={tool === "circle"} label="Círculo" hint="C" onClick={() => setTool("circle")} icon="circle" />
           <ToolBtn active={tool === "arc"} label="Arco" hint="A" onClick={() => setTool("arc")} icon="arc" />
@@ -1369,7 +1491,7 @@ function WeldSketch() {
         <div className="ws-canvaswrap">
           <svg
             ref={svgRef}
-            className={`ws-canvas ${spaceHeld || tool === "mano" ? "panning" : ""}`}
+            className={`ws-canvas ${spaceHeld || tool === "mano" ? "panning" : ""} ${tool === "borrar" ? "erasing" : ""}`}
             onPointerDown={handleCanvasPointerDown}
             onPointerMove={handleCanvasPointerMove}
             onPointerUp={handleCanvasPointerUp}
@@ -1409,6 +1531,7 @@ function WeldSketch() {
               ))}
 
               {draft && draft.cursor && <DraftPreview draft={draft} color={activeColor} scale={viewport.scale} />}
+              {tool === "borrar" && <EraseCellPreview p={cursorWorld} scale={viewport.scale} active={eraseDragRef.current} />}
             </g>
 
             {textEdit && (
@@ -1457,6 +1580,28 @@ function WeldSketch() {
               </foreignObject>
             )}
           </svg>
+
+          {/* FAB — accesos rápidos flotantes para móvil: las 4 herramientas más
+              usadas al alcance del pulgar, más un botón que abre el resto del
+              set de herramientas (el mismo cajón lateral de siempre). Solo se
+              ve en pantallas angostas; en escritorio se usa el panel lateral. */}
+          <div className="ws-fabbar">
+            <button className={`ws-fab ${tool === "line" ? "on" : ""}`} onClick={() => setTool("line")} title="Línea (L)">
+              <ToolIcon icon="line" />
+            </button>
+            <button className={`ws-fab ${tool === "rect" ? "on" : ""}`} onClick={() => setTool("rect")} title="Rectángulo (R)">
+              <ToolIcon icon="rect" />
+            </button>
+            <button className={`ws-fab ws-fab-main ${tool === "select" ? "on" : ""}`} onClick={() => setTool("select")} title="Seleccionar (V)">
+              <ToolIcon icon="cursor" />
+            </button>
+            <button className={`ws-fab ${tool === "borrar" ? "on" : ""}`} onClick={() => setTool("borrar")} title="Borrar">
+              <ToolIcon icon="trash" />
+            </button>
+            <button className={`ws-fab ws-fab-more ${mobileToolbarOpen ? "on" : ""}`} onClick={() => setMobileToolbarOpen((o) => !o)} title="Más herramientas">
+              <ToolIcon icon="more" />
+            </button>
+          </div>
 
           <div className="ws-viewctrls">
             <button onClick={() => zoomToFit(false)} title="Zoom a dibujo">
@@ -1553,7 +1698,7 @@ function WeldSketch() {
                 Snap activado
               </label>
               <div className="ws-hint">
-                <b>Atajos:</b> L línea · R rectángulo · C círculo · A arco · P polígono · G perfil · S soldadura · T texto · D cota · F flecha · H mano (desplazar) · Supr borrar · Ctrl+Z/Y deshacer/rehacer · Ctrl+S guardar · Ctrl+D duplicar
+                <b>Atajos:</b> L línea · B lápiz libre · R rectángulo · C círculo · A arco · P polígono · G perfil · S soldadura · T texto · D cota · F flecha · H mano (desplazar) · Supr borrar · Ctrl+Z/Y deshacer/rehacer · Ctrl+S guardar · Ctrl+D duplicar
               </div>
             </>
           )}
@@ -1611,7 +1756,7 @@ function WeldSketch() {
    ========================================================================= */
 
 function toolLabel(t) {
-  return { select: "Seleccionar", mano: "Mano (desplazar)", line: "Línea", rect: "Rectángulo", circle: "Círculo", arc: "Arco", polygon: "Polígono", perfil: "Perfil", texto: "Texto", cota: "Cota", arrow: "Flecha", weld: "Soldadura", borrar: "Borrar" }[t] || t;
+  return { select: "Seleccionar", mano: "Mano (desplazar)", line: "Línea", rect: "Rectángulo", circle: "Círculo", arc: "Arco", polygon: "Polígono", perfil: "Perfil", texto: "Texto", cota: "Cota", arrow: "Flecha", weld: "Soldadura", borrar: "Borrar", lapiz: "Lápiz libre" }[t] || t;
 }
 
 function ToolBtn({ active, label, hint, onClick, icon }) {
@@ -1636,6 +1781,12 @@ function ToolIcon({ icon }) {
       return (
         <svg {...common}>
           <line x1="4" y1="20" x2="20" y2="4" />
+        </svg>
+      );
+    case "pencil":
+      return (
+        <svg {...common}>
+          <path d="M4 20 L5 15.5 L15 5.5 A2.1 2.1 0 0 1 18 8.5 L8 18.5 Z M13 7.5 L16 10.5" />
         </svg>
       );
     case "rect":
@@ -1704,6 +1855,14 @@ function ToolIcon({ icon }) {
           <path d="M5 7 H19 M9 7 V4 H15 V7 M7 7 L8 21 H16 L17 7" />
         </svg>
       );
+    case "more":
+      return (
+        <svg {...common} strokeWidth={2.4}>
+          <circle cx="5" cy="12" r="1.3" fill="currentColor" stroke="none" />
+          <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
+          <circle cx="19" cy="12" r="1.3" fill="currentColor" stroke="none" />
+        </svg>
+      );
     default:
       return null;
   }
@@ -1748,6 +1907,127 @@ function shapeBounds(s) {
     minY: Math.min(...pts.map((p) => p.y)),
     maxY: Math.max(...pts.map((p) => p.y)),
   };
+}
+
+/* Devuelve el punto en la fracción t (0..1) del segmento a-b. */
+function pointAt(a, b, t) {
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+/* Recorta un segmento p1-p2 contra una celda rectangular de borrado (ver
+   eraseAtPoint). Devuelve:
+   - "none" si el segmento no toca la celda (no hay que tocar nada)
+   - un array con los 0, 1 o 2 pedazos que quedan FUERA de la celda (cada uno
+     como {p1,p2}), es decir, el trazo ya sin la parte que cae adentro.
+     Usa el algoritmo de recorte de Liang-Barsky. */
+function clipSegmentAgainstCell(p1, p2, cell) {
+  const dx = p2.x - p1.x;
+  const dy = p2.y - p1.y;
+  let t0 = 0,
+    t1 = 1;
+  const clip = (pCoef, qCoef) => {
+    if (pCoef === 0) return qCoef >= 0;
+    const r = qCoef / pCoef;
+    if (pCoef < 0) {
+      if (r > t1) return false;
+      if (r > t0) t0 = r;
+    } else {
+      if (r < t0) return false;
+      if (r < t1) t1 = r;
+    }
+    return true;
+  };
+  const hits =
+    clip(-dx, p1.x - cell.minX) &&
+    clip(dx, cell.maxX - p1.x) &&
+    clip(-dy, p1.y - cell.minY) &&
+    clip(dy, cell.maxY - p1.y);
+  if (!hits || t0 > t1) return "none";
+
+  const total = Math.hypot(dx, dy) || 1;
+  const minT = 1 / total; // no dejar recortes menores a ~1mm de largo
+  const pieces = [];
+  if (t0 > minT) pieces.push({ p1, p2: pointAt(p1, p2, t0) });
+  if (t1 < 1 - minT) pieces.push({ p1: pointAt(p1, p2, t1), p2 });
+  return pieces;
+}
+
+/* Igual que clipSegmentAgainstCell pero para un trazo de lápiz libre (varios
+   puntos seguidos). Recorre el trazo tramo a tramo y arma de nuevo los
+   pedazos que quedan fuera de la celda como trazos independientes: si se
+   borra por el medio, un solo trazo se parte en dos. Devuelve "none" si el
+   trazo entero no toca la celda, o un array de arreglos de puntos (uno por
+   pedazo que sobrevive, cada uno con 2 o más puntos). */
+function clipPolylineAgainstCell(points, cell) {
+  let touched = false;
+  const runs = [];
+  let current = [];
+  const endRun = () => {
+    if (current.length >= 2) runs.push(current);
+    current = [];
+  };
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+    const clip = clipSegmentAgainstCell(a, b, cell);
+    if (clip === "none") {
+      if (current.length === 0) current.push(a);
+      current.push(b);
+      continue;
+    }
+    touched = true;
+    if (clip.length === 0) {
+      // el tramo entero cae dentro de la celda: se pierde
+      endRun();
+      continue;
+    }
+    if (clip.length === 2) {
+      // el recorte queda en el medio del tramo: cierra el pedazo que venía
+      // y arranca uno nuevo del otro lado
+      const [before, after] = clip;
+      if (current.length === 0) current.push(before.p1);
+      current.push(before.p2);
+      endRun();
+      current.push(after.p1, after.p2);
+      continue;
+    }
+    // un solo pedazo restante: toca a "a" (se cortó antes de llegar a "b")
+    // o toca a "b" (se cortó antes de llegar desde "a")
+    const piece = clip[0];
+    const touchesStart = Math.hypot(piece.p1.x - a.x, piece.p1.y - a.y) < 1e-6;
+    if (touchesStart) {
+      if (current.length === 0) current.push(piece.p1);
+      current.push(piece.p2);
+      endRun();
+    } else {
+      endRun();
+      current.push(piece.p1, piece.p2);
+    }
+  }
+  endRun();
+  if (!touched) return "none";
+  return runs;
+}
+
+/* Caja delimitadora "de borrado": igual a shapeBounds para las figuras con
+   puntos de snap, más casos especiales para texto y cota (que no tienen). Se
+   usa solo para decidir qué toca una celda de la grilla al borrar. */
+function eraseBounds(s) {
+  if (s.type === "text") {
+    const size = s.size || 12;
+    const w = Math.max(size, (s.text ? s.text.length : 1) * size * 0.55);
+    return { minX: s.pos.x - size * 0.3, maxX: s.pos.x + w, minY: s.pos.y - size, maxY: s.pos.y + size * 0.3 };
+  }
+  if (s.type === "dimension") {
+    const pad = 4;
+    return {
+      minX: Math.min(s.p1.x, s.p2.x) - pad,
+      maxX: Math.max(s.p1.x, s.p2.x) + pad,
+      minY: Math.min(s.p1.y, s.p2.y) - pad,
+      maxY: Math.max(s.p1.y, s.p2.y) + pad,
+    };
+  }
+  return shapeBounds(s);
 }
 
 /* Punto de referencia (esquina superior-izquierda aprox.) usado para anclar
@@ -1926,13 +2206,18 @@ function dimLabelPos(s) {
 
 /* Dibuja una cota automática (línea de cota + líneas de extensión + texto,
    o línea líder para radios) de forma interactiva, con doble clic para editar. */
-function AutoCotaShape({ desc, color, scale, onDoubleClick, onPointerDown }) {
+function AutoCotaShape({ desc, color, scale, tool, onDoubleClick, onPointerDown }) {
   const fontSize = 10 / scale;
   const sw = 1 / scale;
   const groupProps = {
     className: "ws-autocota",
     onDoubleClick,
     onPointerDown: (e) => {
+      /* Solo interceptamos el toque con la herramienta Seleccionar (para el
+         doble-toque que abre el editor de la cota). Con cualquier otra
+         herramienta dejamos pasar el evento para poder dibujar o borrar
+         justo donde está esta etiqueta/línea de cota. */
+      if (tool !== "select") return;
       e.stopPropagation();
       if (onPointerDown) onPointerDown(e);
     },
@@ -1998,7 +2283,7 @@ function AutoCotaShape({ desc, color, scale, onDoubleClick, onPointerDown }) {
 function ShapeView({ shape: s, unit, selected, dragging, tool, scale, onPointerDownShape, onPointerDownHandle, onDoubleClick, onCotaDoubleClick, onCotaPointerDown }) {
   const stroke = s.color;
   const sw = 1.6 / scale;
-  const interactiveProps = { onPointerDown: onPointerDownShape, onDoubleClick, style: { cursor: tool === "borrar" ? "not-allowed" : tool === "select" ? "move" : "crosshair" } };
+  const interactiveProps = { onPointerDown: onPointerDownShape, onDoubleClick, style: { cursor: tool === "borrar" ? "cell" : tool === "select" ? "move" : "crosshair" } };
 
   let body = null;
   switch (s.type) {
@@ -2039,6 +2324,19 @@ function ShapeView({ shape: s, unit, selected, dragging, tool, scale, onPointerD
       break;
     case "polygon":
       body = <polygon points={s.points.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={stroke} strokeWidth={sw} {...interactiveProps} />;
+      break;
+    case "freehand":
+      body = (
+        <polyline
+          points={s.points.map((p) => `${p.x},${p.y}`).join(" ")}
+          fill="none"
+          stroke={stroke}
+          strokeWidth={sw}
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          {...interactiveProps}
+        />
+      );
       break;
     case "text":
       body = (
@@ -2083,6 +2381,7 @@ function ShapeView({ shape: s, unit, selected, dragging, tool, scale, onPointerD
         desc={desc}
         color={stroke}
         scale={scale}
+        tool={tool}
         onDoubleClick={(e) => {
           e.stopPropagation();
           onCotaDoubleClick && onCotaDoubleClick(s, desc);
@@ -2379,6 +2678,8 @@ function renderShapeStatic(s, unit = "mm") {
       return `<path d="${arcPath(s.center, s.radius, s.start, s.end)}" fill="none" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
     case "polygon":
       return `<polygon points="${s.points.map((p) => `${p.x},${p.y}`).join(" ")}" fill="none" stroke="${stroke}" stroke-width="1" />${measureSvg}`;
+    case "freehand":
+      return `<polyline points="${s.points.map((p) => `${p.x},${p.y}`).join(" ")}" fill="none" stroke="${stroke}" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" />`;
     case "text":
       return `<text x="${s.pos.x}" y="${s.pos.y}" font-size="${s.size}" fill="${stroke}" font-family="sans-serif"${s.rotation ? ` transform="rotate(${s.rotation} ${s.pos.x} ${s.pos.y})"` : ""}>${escapeXml(s.text)}</text>`;
     case "dimension":
@@ -2469,6 +2770,28 @@ function renderWeldStatic(s) {
   return `<line x1="${g.leader.x1}" y1="${g.leader.y1}" x2="${g.leader.x2}" y2="${g.leader.y2}" stroke="${s.color}" stroke-width="0.7" marker-end="url(#arrowend)"/><line x1="${g.ref.x1}" y1="${g.ref.y1}" x2="${g.ref.x2}" y2="${g.ref.y2}" stroke="${s.color}" stroke-width="0.7"/>${glyphSvg}${allAroundSvg}${campoSvg}${sizeSvg}${tailSvg}`;
 }
 
+/* Resalta en el lienzo la celda de 10x10mm que la herramienta "Borrar" va a
+   eliminar en la posición actual del puntero: da una referencia visual clara
+   de "esto es lo que se va a borrar" antes (y mientras) tocás/arrastrás. */
+function EraseCellPreview({ p, scale, active }) {
+  const gs = ERASE_CELL_MM;
+  const x = Math.floor(p.x / gs) * gs;
+  const y = Math.floor(p.y / gs) * gs;
+  return (
+    <rect
+      x={x}
+      y={y}
+      width={gs}
+      height={gs}
+      fill={active ? "rgba(198,57,44,0.28)" : "rgba(198,57,44,0.14)"}
+      stroke="#C6392C"
+      strokeWidth={1.2 / scale}
+      strokeDasharray={active ? undefined : `${2.5 / scale},${2.5 / scale}`}
+      pointerEvents="none"
+    />
+  );
+}
+
 function DraftPreview({ draft, color, scale }) {
   const sw = 1.4 / scale;
   const dash = `${3 / scale},${3 / scale}`;
@@ -2500,6 +2823,9 @@ function DraftPreview({ draft, color, scale }) {
   if (draft.tool === "polygon") {
     return <polyline points={[...pts, cur].map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
   }
+  if (draft.tool === "lapiz") {
+    return <polyline points={pts.map((p) => `${p.x},${p.y}`).join(" ")} fill="none" stroke={color} strokeWidth={1.6 / scale} strokeLinecap="round" strokeLinejoin="round" />;
+  }
   if (draft.tool === "cota") {
     return <line x1={pts[0].x} y1={pts[0].y} x2={cur.x} y2={cur.y} stroke={color} strokeWidth={sw} strokeDasharray={dash} />;
   }
@@ -2510,7 +2836,7 @@ function DraftPreview({ draft, color, scale }) {
 }
 
 /* Agranda/achica una figura manteniendo su centro fijo. factor > 1 agranda, < 1 achica. */
-const SCALE_SUPPORTED_TYPES = new Set(["line", "arrow", "weld", "rect", "profile", "circle", "polygon", "text"]);
+const SCALE_SUPPORTED_TYPES = new Set(["line", "arrow", "weld", "rect", "profile", "circle", "polygon", "text", "freehand"]);
 function scaleShapeAround(shape, factor) {
   switch (shape.type) {
     case "line":
@@ -2535,7 +2861,8 @@ function scaleShapeAround(shape, factor) {
     }
     case "circle":
       return { radius: Math.max(shape.radius * factor, 2) };
-    case "polygon": {
+    case "polygon":
+    case "freehand": {
       const cx = shape.points.reduce((s, p) => s + p.x, 0) / shape.points.length;
       const cy = shape.points.reduce((s, p) => s + p.y, 0) / shape.points.length;
       return { points: shape.points.map((p) => ({ x: cx + (p.x - cx) * factor, y: cy + (p.y - cy) * factor })) };
@@ -2748,7 +3075,7 @@ function shiftShapeTo(shape, newX, newY, onChange) {
   onChange({ p1: { x: shape.p1.x + dx, y: shape.p1.y + dy }, p2: { x: shape.p2.x + dx, y: shape.p2.y + dy } });
 }
 function typeLabelEs(t) {
-  return { line: "Línea", rect: "Rectángulo", circle: "Círculo", arc: "Arco", polygon: "Polígono", profile: "Perfil", text: "Texto", arrow: "Flecha", dimension: "Cota", weld: "Símbolo de soldadura" }[t] || t;
+  return { line: "Línea", rect: "Rectángulo", circle: "Círculo", arc: "Arco", polygon: "Polígono", profile: "Perfil", text: "Texto", arrow: "Flecha", dimension: "Cota", weld: "Símbolo de soldadura", freehand: "Trazo libre" }[t] || t;
 }
 
 function NumField({ label, value, unit, onCommit, isDeg }) {
@@ -2847,6 +3174,7 @@ const CSS = `
 .ws-canvaswrap{ flex:1; position:relative; background:var(--canvasbg); overflow:hidden; }
 .ws-canvas{ width:100%; height:100%; display:block; touch-action:none; }
 .ws-canvas.panning{ cursor:grab; }
+.ws-canvas.erasing{ cursor:cell; }
 .ws-sheet{ fill:var(--sheet); stroke:var(--border); stroke-width:0.6; filter:drop-shadow(0 1px 6px rgba(0,0,0,.12)); }
 .ws-grid{ stroke:var(--grid); }
 .ws-shape{ }
@@ -2867,6 +3195,23 @@ const CSS = `
 .ws-inlineinput{ width:100%; height:26px; border:1.5px solid var(--accent); border-radius:5px; padding:2px 6px; font-family:'IBM Plex Sans',sans-serif; font-size:13px; background:var(--panel); color:var(--ink); }
 
 .ws-viewctrls{ position:absolute; right:14px; bottom:14px; display:flex; gap:6px; }
+
+/* FAB de accesos rápidos táctiles: oculto en escritorio, solo aparece en la
+   media query móvil de abajo. Estilo "dock" flotante centrado, con blur y
+   sombra para que se lea como una barra flotante profesional sobre el lienzo. */
+.ws-fabbar{ display:none; }
+.ws-fab{
+  width:50px; height:50px; min-height:0; padding:0; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--panel); border:1px solid var(--border);
+  box-shadow:0 3px 10px rgba(0,0,0,.22); color:var(--ink);
+}
+.ws-fab svg{ width:21px; height:21px; }
+.ws-fab.on{ background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 3px 12px rgba(0,0,0,.3); }
+.ws-fab-main{ width:58px; height:58px; }
+.ws-fab-main svg{ width:24px; height:24px; }
+.ws-fab-more{ width:44px; height:44px; opacity:.9; }
+.ws-fab-more svg{ width:19px; height:19px; }
 
 .ws-props{ width:250px; flex:0 0 250px; border-left:1px solid var(--border); background:var(--panel); padding:14px; overflow-y:auto; }
 .ws-props h4{ margin:0 0 10px 0; font-size:13px; text-transform:none; color:var(--ink); }
@@ -2938,6 +3283,14 @@ const CSS = `
 
   .ws-viewctrls{ right:10px; bottom:calc(10px + env(safe-area-inset-bottom)); }
   .ws-viewctrls button{ min-width:44px; min-height:44px; font-size:15px; }
+
+  /* Dock de accesos rápidos: fila centrada, flotando sobre el lienzo, justo
+     por encima de los botones "Todo/Selección/+/−" para no taparlos. */
+  .ws-fabbar{
+    display:flex; align-items:center; justify-content:center; gap:10px;
+    position:absolute; left:50%; bottom:calc(70px + env(safe-area-inset-bottom));
+    transform:translateX(-50%); z-index:20;
+  }
 
   .ws-statusbar{ font-size:10px; gap:10px; padding:5px 10px; overflow-x:auto; white-space:nowrap; }
   .ws-statusbar span:nth-child(4){ display:none; } /* grid size, low priority on phone */
