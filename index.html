@@ -465,6 +465,31 @@ function WeldSketch() {
   const pinchState = useRef(null);
   const [mobileToolbarOpen, setMobileToolbarOpen] = useState(false);
   const [mobilePropsOpen, setMobilePropsOpen] = useState(false);
+  const isTouchDevice = useMemo(() => (typeof window !== "undefined" && (("ontouchstart" in window) || navigator.maxTouchPoints > 0)), []);
+  const touchDrawRef = useRef(null); // { tool, startWorld, pointerId, moved } - continuous drag-to-draw on touch
+  /* Detección manual de doble toque (móvil): el navegador no siempre sintetiza
+     "dblclick" de forma fiable a partir de dos toques dentro de un lienzo SVG
+     con touch-action:none, así que para tocar dos veces una figura o una cota
+     y editarla en el teléfono usamos este contador propio, sin interferir con
+     el dibujo por arrastre continuo (touchDrawRef) ni con el paneo/zoom. */
+  const lastTapRef = useRef(null); // { key, time, x, y }
+  const DOUBLE_TAP_MS = 350;
+  const DOUBLE_TAP_DIST = 26; // px de pantalla
+  const checkDoubleTap = useCallback(
+    (e, key) => {
+      if (!isTouchDevice || e.pointerType !== "touch") return false;
+      const now = Date.now();
+      const last = lastTapRef.current;
+      const isDouble = last && last.key === key && now - last.time < DOUBLE_TAP_MS && Math.hypot(e.clientX - last.x, e.clientY - last.y) < DOUBLE_TAP_DIST;
+      if (isDouble) {
+        lastTapRef.current = null;
+        return true;
+      }
+      lastTapRef.current = { key, time: now, x: e.clientX, y: e.clientY };
+      return false;
+    },
+    [isTouchDevice]
+  );
 
   const sheetDims = useMemo(() => {
     if (d.sheet.type === "infinite") return null;
@@ -479,6 +504,14 @@ function WeldSketch() {
     if (!selectedId) setMobilePropsOpen(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId]);
+
+  /* Si el usuario cambia de herramienta (p.ej. desde el menú táctil) mientras
+     hay un arrastre-de-dibujo en curso, se cancela para no dejar un borrador
+     "fantasma" que termine creando una figura rara en el próximo toque. */
+  useEffect(() => {
+    touchDrawRef.current = null;
+    setDraft(null);
+  }, [tool]);
 
   /* ---------------- coordinate transforms ---------------- */
   const worldToScreen = useCallback((p) => ({ x: p.x * viewport.scale + viewport.ox, y: p.y * viewport.scale + viewport.oy }), [viewport]);
@@ -574,6 +607,7 @@ function WeldSketch() {
     if (activePointers.current.size >= 2) {
       // entering / continuing a two-finger gesture: cancel any single-finger action in progress
       panRef.current = null;
+      touchDrawRef.current = null;
       setDraft(null);
       setDragState(null);
       const pts = Array.from(activePointers.current.values()).slice(0, 2);
@@ -596,6 +630,18 @@ function WeldSketch() {
 
     if (tool === "select") return; // handled by shape/handle onPointerDown
     if (tool === "borrar") return; // handled by shape onClick
+
+    /* --- En táctil, las herramientas de dos puntos se dibujan con un solo
+       arrastre continuo (dedo abajo = inicio, dedo arriba = fin), igual que
+       cualquier app de lienzo táctil. Evita que un toque suelto cree figuras
+       o medidas fantasma al completar un "segundo toque" accidental. --- */
+    const TWO_POINT_TOOLS = new Set(["line", "arrow", "rect", "perfil", "circle", "weld"]);
+    const isLinearCota = tool === "cota" && dimKind !== "angulo";
+    if (isTouchDevice && e.pointerType === "touch" && (TWO_POINT_TOOLS.has(tool) || isLinearCota)) {
+      touchDrawRef.current = { tool, pointerId: e.pointerId, moved: false, dimKind };
+      setDraft({ tool, points: [p], profileType, weldType });
+      return;
+    }
 
     if (tool === "line" || tool === "arrow") {
       if (!draft) setDraft({ tool, points: [p] });
@@ -757,7 +803,72 @@ function WeldSketch() {
       panRef.current = null;
       if (dragState) setDragState(null);
     }
+
+    /* --- Cierre del arrastre continuo táctil: al levantar el dedo se
+       finaliza la figura con el punto actual. Si el arrastre fue demasiado
+       corto (un simple toque, sin desplazamiento real) se descarta el
+       borrador en vez de crear una figura de tamaño casi nulo. --- */
+    const td = touchDrawRef.current;
+    if (td && e && e.pointerId === td.pointerId) {
+      touchDrawRef.current = null;
+      const endRaw = getPointerWorld(e);
+      const endP = snapWorldPoint(endRaw, draft && draft.excludeId);
+      const startP = draft && draft.points && draft.points[0];
+      if (!startP || dist(startP, endP) < 4 / viewport.scale) {
+        setDraft(null);
+        return;
+      }
+      if (td.tool === "line" || td.tool === "arrow") {
+        const p2 = snapAngleDeg(startP, endP);
+        pushShape({ id: uid(), type: td.tool, p1: startP, p2, color: activeColor });
+      } else if (td.tool === "rect") {
+        pushShape({ id: uid(), type: "rect", p1: startP, p2: endP, color: activeColor });
+      } else if (td.tool === "perfil") {
+        pushShape({ id: uid(), type: "profile", profileType: draft.profileType || profileType, p1: startP, p2: endP, thickness: 5, rotation: 0, mirror: false, mirrorV: false, color: activeColor });
+      } else if (td.tool === "circle") {
+        pushShape({ id: uid(), type: "circle", center: startP, radius: dist(startP, endP), color: activeColor });
+      } else if (td.tool === "weld") {
+        pushShape({
+          id: uid(),
+          type: "weld",
+          weldType: draft.weldType || weldType,
+          p1: startP,
+          p2: endP,
+          side: "flecha",
+          size: "",
+          length: 40,
+          allAround: false,
+          campo: false,
+          tail: "",
+          color: activeColor,
+        });
+      } else if (td.tool === "cota") {
+        let kind = td.dimKind;
+        if (kind === "auto") {
+          const dx = Math.abs(endP.x - startP.x);
+          const dy = Math.abs(endP.y - startP.y);
+          kind = dx >= dy ? "horizontal" : "vertical";
+        }
+        const offset = kind === "horizontal" || kind === "vertical" ? pickDimSide(startP, endP, kind, d.shapes) * 20 : -20;
+        pushShape({ id: uid(), type: "dimension", kind, p1: startP, p2: endP, offset, color: activeColor });
+      }
+      setDraft(null);
+    }
   };
+
+  /* Abre el editor de una figura (texto o cota manual) - usado tanto por el
+     doble clic de escritorio como por el doble toque táctil. */
+  function openShapeEditor(s) {
+    if (s.type === "text") setTextEdit({ id: s.id, value: s.text, isNew: false, pos: s.pos });
+    else if (s.type === "dimension") setDimEdit({ id: s.id, value: dimEdit && dimEdit.id === s.id ? dimEdit.value : dimLabel(s, d.unit) });
+  }
+  /* Abre el editor de una cota automática (medida de un lado de la figura) -
+     usado tanto por el doble clic de escritorio como por el doble toque táctil. */
+  function openCotaEditor(shape, desc) {
+    const pos = desc.kind === "leader" || desc.kind === "plain" ? desc.textPos : mid(desc.a, desc.bpt);
+    const autoDesc = computeAutoCotas({ ...shape, cotas: {} }, d.unit, 1).find((x) => x.side === desc.side);
+    setMeasureEdit({ id: shape.id, side: desc.side, value: (shape.cotas && shape.cotas[desc.side]) || "", placeholder: autoDesc ? autoDesc.label : "", pos });
+  }
 
   /* ---------------- dragging shapes / handles (select tool) ---------------- */
   function startDragMove(e, shape) {
@@ -767,6 +878,13 @@ function WeldSketch() {
       return;
     }
     if (tool !== "select") return;
+    /* Doble toque táctil sobre la figura = abrir su editor (texto/cota),
+       igual que el doble clic en escritorio, sin iniciar un arrastre. */
+    if (checkDoubleTap(e, "shape:" + shape.id)) {
+      setSelectedId(shape.id);
+      openShapeEditor(shape);
+      return;
+    }
     setSelectedId(shape.id);
     const raw = getPointerWorld(e);
     setDragState({ mode: "move", id: shape.id, start: raw, origShape: shape });
@@ -1259,14 +1377,12 @@ function WeldSketch() {
                   scale={viewport.scale}
                   onPointerDownShape={(e) => startDragMove(e, s)}
                   onPointerDownHandle={(e, key) => startDragHandle(e, s, key)}
-                  onDoubleClick={() => {
-                    if (s.type === "text") setTextEdit({ id: s.id, value: s.text, isNew: false, pos: s.pos });
-                    else if (s.type === "dimension") setDimEdit({ id: s.id, value: dimEdit && dimEdit.id === s.id ? dimEdit.value : dimLabel(s, d.unit) });
-                  }}
-                  onCotaDoubleClick={(shape, desc) => {
-                    const pos = desc.kind === "leader" || desc.kind === "plain" ? desc.textPos : mid(desc.a, desc.bpt);
-                    const autoDesc = computeAutoCotas({ ...shape, cotas: {} }, d.unit, 1).find((x) => x.side === desc.side);
-                    setMeasureEdit({ id: shape.id, side: desc.side, value: (shape.cotas && shape.cotas[desc.side]) || "", placeholder: autoDesc ? autoDesc.label : "", pos });
+                  onDoubleClick={() => openShapeEditor(s)}
+                  onCotaDoubleClick={(shape, desc) => openCotaEditor(shape, desc)}
+                  onCotaPointerDown={(e, shape, desc) => {
+                    /* Doble toque táctil sobre una cota de la figura = abrir su editor,
+                       igual que el doble clic en escritorio (ver checkDoubleTap arriba). */
+                    if (checkDoubleTap(e, "cota:" + shape.id + ":" + desc.side)) openCotaEditor(shape, desc);
                   }}
                 />
               ))}
@@ -1778,13 +1894,16 @@ function dimLabelPos(s) {
 
 /* Dibuja una cota automática (línea de cota + líneas de extensión + texto,
    o línea líder para radios) de forma interactiva, con doble clic para editar. */
-function AutoCotaShape({ desc, color, scale, onDoubleClick }) {
+function AutoCotaShape({ desc, color, scale, onDoubleClick, onPointerDown }) {
   const fontSize = 10 / scale;
   const sw = 1 / scale;
   const groupProps = {
     className: "ws-autocota",
     onDoubleClick,
-    onPointerDown: (e) => e.stopPropagation(),
+    onPointerDown: (e) => {
+      e.stopPropagation();
+      if (onPointerDown) onPointerDown(e);
+    },
     style: { cursor: "text" },
   };
   if (desc.kind === "leader") {
@@ -1844,7 +1963,7 @@ function AutoCotaShape({ desc, color, scale, onDoubleClick }) {
 }
 
 /* Renders one shape, either interactive (with selection handles) or static (export) */
-function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, onPointerDownHandle, onDoubleClick, onCotaDoubleClick }) {
+function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, onPointerDownHandle, onDoubleClick, onCotaDoubleClick, onCotaPointerDown }) {
   const stroke = s.color;
   const sw = 1.6 / scale;
   const interactiveProps = { onPointerDown: onPointerDownShape, onDoubleClick, style: { cursor: tool === "borrar" ? "not-allowed" : tool === "select" ? "move" : "crosshair" } };
@@ -1921,6 +2040,7 @@ function ShapeView({ shape: s, unit, selected, tool, scale, onPointerDownShape, 
           e.stopPropagation();
           onCotaDoubleClick && onCotaDoubleClick(s, desc);
         }}
+        onPointerDown={(e) => onCotaPointerDown && onCotaPointerDown(e, s, desc)}
       />
     ));
   }
