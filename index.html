@@ -877,7 +877,16 @@ function WeldSketch() {
       deleteShape(shape.id);
       return;
     }
-    if (tool !== "select") return;
+    /* Tocar/hacer clic sobre cualquier figura ya dibujada la selecciona
+       automáticamente y cambia a la herramienta "Seleccionar" si hacía
+       falta, para poder alargarla, acortarla o mover sus manijas sin
+       tener que pulsar antes el botón "Seleccionar". Si hay un dibujo de
+       varios puntos en curso (p. ej. un polígono a medio trazar) no se
+       interrumpe, para no romper el flujo de dibujo con ajuste (snap). */
+    if (tool !== "select") {
+      if (draft) return;
+      setTool("select");
+    }
     /* Doble toque táctil sobre la figura = abrir su editor (texto/cota),
        igual que el doble clic en escritorio, sin iniciar un arrastre. */
     if (checkDoubleTap(e, "shape:" + shape.id)) {
@@ -1382,7 +1391,19 @@ function WeldSketch() {
                   onCotaPointerDown={(e, shape, desc) => {
                     /* Doble toque táctil sobre una cota de la figura = abrir su editor,
                        igual que el doble clic en escritorio (ver checkDoubleTap arriba). */
-                    if (checkDoubleTap(e, "cota:" + shape.id + ":" + desc.side)) openCotaEditor(shape, desc);
+                    if (checkDoubleTap(e, "cota:" + shape.id + ":" + desc.side)) {
+                      openCotaEditor(shape, desc);
+                      return;
+                    }
+                    /* Un solo toque/clic sobre la línea de cota selecciona la figura
+                       (cambiando a "Seleccionar" si hacía falta) para poder alargarla
+                       o acortarla al instante con las manijas, sin pasos extra. */
+                    if (tool === "borrar") return;
+                    if (tool !== "select") {
+                      if (draft) return;
+                      setTool("select");
+                    }
+                    setSelectedId(shape.id);
                   }}
                 />
               ))}
